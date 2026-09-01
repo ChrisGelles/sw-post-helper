@@ -1,0 +1,9 @@
+[project]
+name = "sw-post-helper"
+version = "0.1.0"
+description = "SW_SERIES stringout conform tool"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
