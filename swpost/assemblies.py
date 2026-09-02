@@ -8,7 +8,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from swpost.paths import canon
+from swpost.person import person_for_basename
 from swpost.reference import REFERENCE_DIR
+
+
+class SyncAssemblyError(ValueError):
+    """Pinned v03 sync assembly failed camera-prefix validation."""
 
 ROLES = ("CAM_B", "CAM_A", "BOOM", "LAV", "LAV_INT")
 
@@ -16,37 +21,6 @@ JUNE_VIDEO_ROLES: tuple[str | None, ...] = ("CAM_B", "CAM_A", None)
 JUNE_AUDIO_ROLES: tuple[str | None, ...] = (None, "BOOM", "LAV", "LAV_INT", None, None)
 AUG10_VIDEO_ROLES: tuple[str | None, ...] = ("CAM_B", None)
 AUG10_AUDIO_ROLES: tuple[str | None, ...] = (None, "LAV")
-
-JUNE_SEGMENTS: list[tuple[str, int, int]] = [
-    ("Kiki Redhead", 0, 83295),
-    ("Kiki Redhead", 83295, 109064),
-    ("Jim Leonard", 109064, 208056),
-    ("Stacy Conté", 208056, 282402),
-    ("Stephanie Castro", 282402, 334323),
-    ("Tony Rook", 334323, 411381),
-    ("Morgan Sibbald", 411381, 515148),
-    ("Tony Rook", 515148, 533764),
-    ("Forrest Blackburn", 533764, 593423),
-    ("Forrest Blackburn", 593423, 620331),
-    ("Jim Leonard", 620331, 643326),
-]
-
-AUG10_SEGMENTS: list[tuple[str, int, int]] = [
-    ("Chi Lee", 0, 36876),
-    ("Chi Lee", 36876, 62408),
-    ("Destiny Thomas", 62408, 80646),
-    ("Destiny Thomas", 80646, 95254),
-    ("Caitlin Colleary", 95254, 116165),
-    ("Caitlin Colleary", 116165, 131253),
-    ("Caitlin Colleary", 131253, 138420),
-    ("Nikki Burt", 138420, 151275),
-    ("Nikki Burt", 151275, 185801),
-    ("Miranda Sinnott-Armstrong", 185801, 218172),
-    ("Miranda Sinnott-Armstrong", 218172, 251721),
-    ("Emma Finestone", 251721, 276649),
-    ("Emma Finestone", 276649, 279671),
-]
-
 
 @dataclass(frozen=True)
 class Interval:
@@ -94,7 +68,7 @@ class ReferenceBundle:
     aug10: AssemblyMaps
     b_to_a: list[OffsetEntry]
     b_to_boom: list[BKeyedOffset]
-    b_to_lav: list[BKeyedOffset]
+    aug10_audio_substitutions: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -138,11 +112,12 @@ def _resolve_file(ci: ET.Element, files: dict[str, tuple[str, str]]) -> tuple[st
     return files.get(file_el.get("id", ""), ("", ""))
 
 
-def person_for_stringout_frame(frame: int, shoot: str) -> str:
-    segments = JUNE_SEGMENTS if shoot == "june" else AUG10_SEGMENTS
-    for name, start, end in segments:
-        if start <= frame < end:
-            return name
+def person_at_stringout_frame(frame: int, assembly: AssemblyMaps) -> str:
+    """Person for a stringout frame from assembly interval coverage (no segment constants)."""
+    for role in ("CAM_B", "CAM_A"):
+        for iv in assembly.intervals.get(role, []):
+            if iv.tl_in <= frame < iv.tl_out:
+                return iv.person
     return "Unknown"
 
 
@@ -215,7 +190,7 @@ def _append_track_intervals(
                 source_in=source_in,
                 source_out=source_out,
                 sourcetrack_index=sourcetrack_index,
-                person=person_for_stringout_frame(tl_in, shoot),
+                person=person_for_basename(basename),
             )
         )
 
@@ -436,17 +411,72 @@ def parse_v02b_b_keyed_offsets(path: Path, audio_track_name: str) -> list[BKeyed
     return parse_v03_b_keyed_offsets(path, audio_track_name)
 
 
+def assert_v03_video_camera_prefixes(path: Path) -> None:
+    """Hard stop if v03 V1/V2 resolved basenames violate A/B camera prefix rule."""
+    root = ET.parse(path).getroot()
+    files = _build_file_map(root)
+    video = root.find(".//sequence/media/video")
+    if video is None:
+        raise SyncAssemblyError(f"no video in {path.name}")
+    tracks = video.findall("track")
+    if len(tracks) < 2:
+        raise SyncAssemblyError(f"expected V1/V2 camera tracks in {path.name}")
+    rules = [(0, "A"), (1, "B")]
+    errors: list[str] = []
+    for idx, prefix in rules:
+        for ci in tracks[idx].findall("clipitem"):
+            basename, _ = _resolve_file(ci, files)
+            if not basename:
+                continue
+            if not basename.startswith(prefix):
+                name = ci.findtext("name", "")
+                errors.append(
+                    f"V{idx + 1} clipitem {name!r} resolves to {basename!r} (expected {prefix}…)"
+                )
+    if errors:
+        raise SyncAssemblyError(
+            f"v03 camera-prefix violations in {path.name}:\n" + "\n".join(errors)
+        )
+
+
+def scan_v03_audio_substitutions(path: Path) -> list[dict]:
+    """Informational: clipitem name ≠ resolved file on v03 audio tracks."""
+    root = ET.parse(path).getroot()
+    files = _build_file_map(root)
+    audio = root.find(".//sequence/media/audio")
+    if audio is None:
+        return []
+    subs: list[dict] = []
+    for tr in audio.findall("track"):
+        track_name = tr.get("MZ.TrackName") or ""
+        for ci in tr.findall("clipitem"):
+            clip_name = ci.findtext("name", "")
+            basename, _ = _resolve_file(ci, files)
+            if not clip_name or not basename or clip_name == basename:
+                continue
+            subs.append(
+                {
+                    "track": track_name or "unnamed",
+                    "clipitem_name": clip_name,
+                    "resolved_file": basename,
+                    "note": "intentional substitution — emit normally",
+                }
+            )
+    return subs
+
+
 def load_reference_assemblies(
     reference_dir: Path | None = None,
 ) -> ReferenceBundle:
     ref = reference_dir or REFERENCE_DIR
     v03 = ref / "081026-Stringout-Source-v03-cg.xml"
+    assert_v03_video_camera_prefixes(v03)
     return ReferenceBundle(
         june=parse_assembly(ref / "CMNH-SW-stringout-ref-270.xml", "june"),
         aug10=parse_assembly(ref / "081026-Stringout-Source-v02-cg.xml", "aug10"),
         b_to_a=parse_v03_offsets(v03),
         b_to_boom=parse_v03_b_keyed_offsets(v03, "BOOM"),
-        b_to_lav=parse_v03_b_keyed_offsets(v03, "LAV"),
+        aug10_audio_substitutions=scan_v03_audio_substitutions(v03),
     )
 
 
@@ -457,14 +487,3 @@ def load_reference_assemblies_legacy(
     return bundle.june, bundle.aug10, bundle.b_to_a
 
 
-def detect_link_defects(path: Path) -> list[tuple[str, str]]:
-    root = ET.parse(path).getroot()
-    files = _build_file_map(root)
-    v1 = root.find(".//sequence/media/video/track")
-    defects = []
-    for ci in v1.findall("clipitem"):
-        name = ci.findtext("name", "")
-        basename, _ = _resolve_file(ci, files)
-        if name and basename and name != basename:
-            defects.append((name, basename))
-    return defects

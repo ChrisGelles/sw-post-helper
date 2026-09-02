@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from swpost.assemblies import load_reference_assemblies
+from swpost.assemblies import load_reference_assemblies, parse_v03_b_keyed_offsets
+from swpost.reference import REFERENCE_DIR
 from swpost.prproj import iter_sequences, load_prproj
 from swpost.project import extract_proxy_cuts, project_prproj
 
@@ -62,9 +63,10 @@ def test_v03_boom_offset_table_sixteen_rows():
 
 
 def test_v03_lav_offset_table_fifteen_rows():
-    refs = load_reference_assemblies()
-    assert len(refs.b_to_lav) == 15
-    caitlin = [o for o in refs.b_to_lav if o.media_file == "Lav 03 Caitlin Take 01.wav"]
+    v03 = REFERENCE_DIR / "081026-Stringout-Source-v03-cg.xml"
+    lav = parse_v03_b_keyed_offsets(v03, "LAV")
+    assert len(lav) == 15
+    caitlin = [o for o in lav if o.media_file == "Lav 03 Caitlin Take 01.wav"]
     assert len(caitlin) == 1
     assert caitlin[0].b_src_in == 748
 

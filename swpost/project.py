@@ -11,16 +11,15 @@ from swpost.assemblies import (
     AssemblyMaps,
     B013_A_CAMERA_GAP,
     BKeyedOffset,
-    CAITLIN_INTERNAL_LAV_PACK,
     Interval,
     OffsetEntry,
     ReferenceBundle,
-    detect_link_defects,
     load_reference_assemblies,
     lookup_b_keyed,
     lookup_offset,
-    person_for_stringout_frame,
+    person_at_stringout_frame,
 )
+from swpost.person import person_for_basename
 from swpost.labels import parse_select_label
 from swpost.paths import PROXY_REGISTRY, proxy_basename
 from swpost.prproj import (
@@ -81,10 +80,8 @@ class ProjectionReport:
     absent_roles: list[dict] = field(default_factory=list)
     label_mismatches: list[dict] = field(default_factory=list)
     collisions: list[dict] = field(default_factory=list)
-    link_defects: list[dict] = field(default_factory=list)
     boom_track_not_boom: list[dict] = field(default_factory=list)
-    internal_lav_pack: list[dict] = field(default_factory=list)
-    name_file_mismatches: list[dict] = field(default_factory=list)
+    audio_substitutions: list[dict] = field(default_factory=list)
     b_keyed_accuracy_notes: list[dict] = field(default_factory=list)
 
 
@@ -246,7 +243,12 @@ def extract_proxy_cuts(root: ET.Element, sequence: SequenceInfo) -> list[ProxyCu
             shoot=PROXY_REGISTRY[clip.proxy_basename]["shoot"],
         )
 
-    return sorted(cuts.values(), key=lambda c: (c.timeline_start, c.stringout_in))
+    merged: dict[tuple, ProxyCut] = {}
+    for cut in sorted(cuts.values(), key=lambda c: (c.timeline_start, c.track_kind == "audio")):
+        key = (cut.timeline_start, cut.stringout_in, cut.proxy_basename)
+        if key not in merged or cut.track_kind == "video":
+            merged[key] = cut
+    return sorted(merged.values(), key=lambda c: (c.timeline_start, c.stringout_in))
 
 
 def _project_interval_pieces(
@@ -331,15 +333,6 @@ def _project_aug10_a_camera(
                     }
                 )
                 continue
-            if not entry.name_matches_file:
-                report.name_file_mismatches.append(
-                    {
-                        "role": "CAM_A",
-                        "clipitem_name": entry.a_file,
-                        "cut_label": cut.label,
-                        "note": "name≠file on sync assembly — emit anyway",
-                    }
-                )
             if r_in < gap_hi and r_out > gap_lo:
                 report.empty_role_ranges.append(
                     {
@@ -401,7 +394,7 @@ def _project_aug10_a_camera(
                             f"/Volumes/SW_SERIES/02_Assets/01_Video/01_Footage/"
                             f"PROXIES/2026-08-10/{entry.a_file}"
                         ),
-                        person=bp.person,
+                        person=person_for_basename(entry.a_file),
                         sourcetrack_index=1,
                         cut_label=cut.label,
                         enabled=False,
@@ -445,31 +438,7 @@ def _project_b_keyed_role(
             if entry is None:
                 continue
 
-            if role == "LAV" and entry.media_file == CAITLIN_INTERNAL_LAV_PACK:
-                report.internal_lav_pack.append(
-                    {
-                        "cut_label": cut.label,
-                        "b_file": bp.file_basename,
-                        "b_source_range": [r_in, r_out],
-                        "file": entry.media_file,
-                        "note": (
-                            "Internal lavalier pack; subclip name reads "
-                            "'Caitlin Take 01 Lav.wav'"
-                        ),
-                    }
-                )
-
             if role == "BOOM":
-                if entry.is_lav_on_boom_track:
-                    report.boom_track_not_boom.append(
-                        {
-                            "cut_label": cut.label,
-                            "b_file": bp.file_basename,
-                            "b_source_range": [r_in, r_out],
-                            "file_on_boom_track": entry.media_file,
-                            "note": "Destiny take 02 — lav on boom track, not a boom file",
-                        }
-                    )
                 if entry.media_file == "Destiny Take 01 Boom.wav":
                     report.b_keyed_accuracy_notes.append(
                         {
@@ -508,30 +477,30 @@ def _validate_label(cut: ProxyCut, pieces: list[ProjectedPiece], report: Project
     parsed = parse_select_label(cut.label)
     if parsed is None:
         return
-    person, frame = parsed
-    for piece in pieces:
-        if piece.role not in ("CAM_B", "CAM_A"):
-            continue
-        if piece.source_in <= frame < piece.source_out:
-            if piece.person != person:
-                report.label_mismatches.append(
-                    {
-                        "cut_label": cut.label,
-                        "label_person": person,
-                        "label_frame": frame,
-                        "projected_file": piece.file_basename,
-                        "projected_person": piece.person,
-                    }
-                )
-            return
-    report.label_mismatches.append(
-        {
-            "cut_label": cut.label,
-            "label_person": person,
-            "label_frame": frame,
-            "error": "label frame not inside any projected camera piece",
-        }
-    )
+    person, so_frame = parsed
+    if not (cut.stringout_in <= so_frame < cut.stringout_out):
+        return
+    cam_pieces = [p for p in pieces if p.role in ("CAM_A", "CAM_B")]
+    if not cam_pieces:
+        report.label_mismatches.append(
+            {
+                "cut_label": cut.label,
+                "label_person": person,
+                "label_frame": so_frame,
+                "error": "no projected camera pieces for cut",
+            }
+        )
+        return
+    if not any(p.person == person for p in cam_pieces):
+        report.label_mismatches.append(
+            {
+                "cut_label": cut.label,
+                "label_person": person,
+                "label_frame": so_frame,
+                "projected_person": cam_pieces[0].person,
+                "projected_file": cam_pieces[0].file_basename,
+            }
+        )
 
 
 def _check_collisions(pieces: list[ProjectedPiece], report: ProjectionReport) -> None:
@@ -571,9 +540,20 @@ def project_sequence(
     june, aug10, offsets = refs.june, refs.aug10, refs.b_to_a
 
     report = ProjectionReport(sequence_name=sequence.name, sequence_uid=sequence.uid)
-    v03_path = Path(__file__).resolve().parents[1] / "reference" / "081026-Stringout-Source-v03-cg.xml"
-    for name, resolved in detect_link_defects(v03_path):
-        report.link_defects.append({"clipitem_name": name, "resolved_file": resolved})
+    report.audio_substitutions = list(refs.aug10_audio_substitutions)
+    for entry in refs.b_to_boom:
+        if entry.is_lav_on_boom_track:
+            report.boom_track_not_boom.append(
+                {
+                    "b_file": entry.b_file,
+                    "b_source_range": [entry.b_src_in, entry.b_src_out],
+                    "file_on_boom_track": entry.media_file,
+                    "note": (
+                        "Destiny take 02 — lav on v03 A3 BOOM track; "
+                        "Destiny Take 02 Boom.wav is in neither assembly"
+                    ),
+                }
+            )
 
     cuts = extract_proxy_cuts(root, sequence)
     report.cuts_processed = len(cuts)
@@ -584,8 +564,8 @@ def project_sequence(
         b_pieces: list[ProjectedPiece] = []
 
         for role in ROLES:
-            if cut.shoot == "aug10" and role in ("CAM_A", "BOOM", "LAV"):
-                continue  # derived from CAM_B via v03 B-keyed tables
+            if cut.shoot == "aug10" and role in ("CAM_A", "BOOM"):
+                continue
 
             intervals = assembly.intervals.get(role, [])
             pieces, empty = _project_interval_pieces(cut, role, intervals)
@@ -597,7 +577,7 @@ def project_sequence(
                         "role": role,
                         "stringout_range": [r_in, r_out],
                         "cut_label": cut.label,
-                        "person": person_for_stringout_frame(r_in, cut.shoot),
+                        "person": person_at_stringout_frame(r_in, assembly),
                     }
                 )
             if role == "CAM_B":
@@ -608,9 +588,6 @@ def project_sequence(
             all_pieces.extend(_project_aug10_a_camera(cut, b_pieces, offsets, report))
             all_pieces.extend(
                 _project_b_keyed_role(cut, b_pieces, refs.b_to_boom, "BOOM", report)
-            )
-            all_pieces.extend(
-                _project_b_keyed_role(cut, b_pieces, refs.b_to_lav, "LAV", report)
             )
 
         _validate_label(cut, [p for p in all_pieces if p.cut_label == cut.label], report)

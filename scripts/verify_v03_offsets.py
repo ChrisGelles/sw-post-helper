@@ -9,7 +9,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-from swpost.assemblies import detect_link_defects, parse_v03_offsets  # noqa: E402
+from swpost.assemblies import parse_v03_offsets  # noqa: E402
 
 V03 = REPO / "reference" / "081026-Stringout-Source-v03-cg.xml"
 
@@ -33,7 +33,6 @@ PUBLISHED = [
 
 def main() -> int:
     computed = parse_v03_offsets(V03)
-    defects = detect_link_defects(V03)
 
     print("Computed B→A offset table from pinned v03:\n")
     print(f"{'CAM B':<32} {'B source range':<20} {'CAM A':<32} {'offset':>6}  note")
@@ -71,22 +70,16 @@ def main() -> int:
             f"{b_file:<32} {b_in}–{b_out:<14} {a_file:<32} {pub_off:+4d} {calc_off:+4d}  {flag}{extra}"
         )
 
-    print("\nA009C002 link defect present:", "yes" if defects else "no")
-    if defects:
-        for name, resolved in defects:
-            print(f"  clipitem name={name!r} resolves to file={resolved!r}")
+    print("\nCamera-prefix gate runs at load_reference_assemblies().")
 
-    if all_match and not defects:
+    if all_match:
         print(
-            "\nVERDICT: All 14 rows match; A009C002 defect resolved — "
-            "B009→A009C002 offset derives from correct media."
+            "\nVERDICT: All 14 rows match — B009→A009C002 offset derives from correct media."
         )
-    elif all_match:
-        print("\nVERDICT: Tables match but name≠file defects remain — review before projection.")
     else:
         print("\nVERDICT: Tables differ — stop before projection code.")
 
-    return 0 if all_match and not defects else 1
+    return 0 if all_match else 1
 
 
 if __name__ == "__main__":

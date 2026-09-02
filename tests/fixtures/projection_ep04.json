@@ -1,0 +1,35 @@
+{
+  "sequence": {
+    "name": "STEM-ep4-rough-main-v01-cl",
+    "uid": "a89bcd5c-8f0a-4a5e-9c3d-1e2f3a4b5c6d"
+  },
+  "first_v1_cut": {
+    "label": "MORGAN 05:22:13:22 — photosynthesis, chlorophyll absorbs sunlight, cascading reactions",
+    "timeline_start": 206,
+    "timeline_end": 326,
+    "stringout_in": 463994,
+    "stringout_out": 464114,
+    "proxy_basename": "270p.mp4",
+    "camera_pieces": [
+      {
+        "role": "CAM_A",
+        "file_basename": "A007C001_260610_R0DH.mov",
+        "source_in": 53237,
+        "source_out": 53357
+      },
+      {
+        "role": "CAM_B",
+        "file_basename": "B003C001_260610_R51N.mov",
+        "source_in": 53336,
+        "source_out": 53456
+      }
+    ]
+  },
+  "label_check": {
+    "timecode": "05:20:05:12",
+    "stringout_frame": 460932,
+    "cut_label": "MORGAN 05:20:05:12 — designing molecules to absorb light; na",
+    "stringout_in": 460932,
+    "stringout_out": 461015
+  }
+}
