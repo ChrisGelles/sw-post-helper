@@ -5,7 +5,9 @@ SW_SERIES stringout conform tool — replaces proxy cuts in Premiere projects wi
 ## Status
 
 - **Milestone 1 complete:** reference assemblies pinned, checksum gate, v02b offset table verified. See `docs/milestone-1-offset-verification.md`.
-- Milestones 2–6: not started.
+- **Milestone 2 complete:** `.prproj` reader and `sw-conform list`. Test fixture: `tests/STEM-ep02-v01-cg.prproj`.
+- **Milestone 3 complete:** projection engine (ep02-tested). Aug 10 boom/lav via B-keyed v02b tables (gate verified; no Aug 10 fixture cut yet). See `docs/milestone-3-projection.md`.
+- Milestones 4–6: not started.
 
 ## Setup
 
@@ -15,6 +17,7 @@ Requires Python 3.11+ and `/Volumes/SW_SERIES` symlink (see `docs/SW_SERIES-conf
 cd /Users/cgelles/Library/CloudStorage/Dropbox/GitHub/sw-post-helper
 python3 -m pytest -q
 python3 scripts/verify_v02b_offsets.py
+./sw-conform list tests/STEM-ep02-v01-cg.prproj
 ```
 
 ## Repo layout

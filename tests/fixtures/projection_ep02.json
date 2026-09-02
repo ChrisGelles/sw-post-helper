@@ -1,0 +1,69 @@
+{
+  "sequence": {
+    "name": "STEM-ep2-edit-v01-cl",
+    "uid": "3ff4a6cc-10c8-4a29-bb48-c046859ffb75"
+  },
+  "cuts_expected": 12,
+  "sample_cut": {
+    "label": "270p_1554",
+    "timeline_start": 311,
+    "timeline_end": 764,
+    "stringout_in": 595273,
+    "stringout_out": 595726,
+    "proxy_basename": "270p.mp4",
+    "pieces": [
+      {
+        "role": "BOOM",
+        "timeline_start": 311,
+        "timeline_end": 764,
+        "source_in": 3951,
+        "source_out": 4404,
+        "file_basename": "Forest Blackburn Take 02 Boom.wav",
+        "person": "Forrest Blackburn"
+      },
+      {
+        "role": "CAM_A",
+        "timeline_start": 311,
+        "timeline_end": 764,
+        "source_in": 4177,
+        "source_out": 4630,
+        "file_basename": "A008C001_260610_R0DH.mov",
+        "person": "Forrest Blackburn"
+      },
+      {
+        "role": "CAM_B",
+        "timeline_start": 311,
+        "timeline_end": 764,
+        "source_in": 3829,
+        "source_out": 4282,
+        "file_basename": "B004C001_260610_R51N.mov",
+        "person": "Forrest Blackburn"
+      },
+      {
+        "role": "LAV",
+        "timeline_start": 311,
+        "timeline_end": 764,
+        "source_in": 3951,
+        "source_out": 4404,
+        "file_basename": "Forest Blackburn Take 02 Lav.wav",
+        "person": "Forrest Blackburn"
+      },
+      {
+        "role": "LAV_INT",
+        "timeline_start": 311,
+        "timeline_end": 764,
+        "source_in": 3551,
+        "source_out": 4004,
+        "file_basename": "Forest Blackburn Take 02.wav",
+        "person": "Forrest Blackburn"
+      }
+    ]
+  },
+  "piece_counts_total": {
+    "CAM_B": 12,
+    "CAM_A": 12,
+    "BOOM": 12,
+    "LAV": 12,
+    "LAV_INT": 6
+  }
+}
