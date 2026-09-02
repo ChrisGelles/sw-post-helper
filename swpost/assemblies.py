@@ -61,8 +61,9 @@ class Interval:
     person: str
 
 
-CAITLIN_EXCLUDED_LAV = "Lav 03 Caitlin Take 01.wav"
-CAITLIN_LAV_BOOM_DRIFT_FRAMES = 263
+CAITLIN_INTERNAL_LAV_PACK = "Lav 03 Caitlin Take 01.wav"
+A011_MAX_SOURCE_FRAME = 33986  # A011C001 clamped duration in v03 sync assembly
+B013_A_CAMERA_GAP = (33986, 36417)  # B-source frames with no A-camera coverage in v03
 
 
 @dataclass(frozen=True)
@@ -84,6 +85,7 @@ class OffsetEntry:
     a_file: str
     offset: int
     name_matches_file: bool
+    a_duration: int | None = None
 
 
 @dataclass
@@ -218,7 +220,15 @@ def _append_track_intervals(
         )
 
 
-def parse_v02b_offsets(path: Path) -> list[OffsetEntry]:
+def _filter_short_b_ranges(
+    b_in: int, b_out: int, min_frames: int = 2
+) -> bool:
+    """Return True if range should be kept (>= min_frames)."""
+    return (b_out - b_in) >= min_frames
+
+
+def parse_v03_offsets(path: Path) -> list[OffsetEntry]:
+    """Pair v03 V1 A camera with V2 B camera; key by B source frame."""
     root = ET.parse(path).getroot()
     files = _build_file_map(root)
     video = root.find(".//sequence/media/video")
@@ -243,10 +253,10 @@ def parse_v02b_offsets(path: Path) -> list[OffsetEntry]:
         if best_a is None:
             continue
         a, tl_start = best_a
-        if a["name"] != a["file_basename"]:
-            continue
         b_src_at = b["src_in"] + (tl_start - b["tl_start"])
         a_src_at = a["src_in"] + (tl_start - a["tl_start"])
+        if not _filter_short_b_ranges(b["src_in"], b["src_out"]):
+            continue
         rows.append(
             OffsetEntry(
                 b_file=b["file_basename"],
@@ -254,16 +264,23 @@ def parse_v02b_offsets(path: Path) -> list[OffsetEntry]:
                 b_src_out=b["src_out"],
                 a_file=a["name"],
                 offset=a_src_at - b_src_at,
-                name_matches_file=True,
+                name_matches_file=(a["name"] == a["file_basename"]),
+                a_duration=a.get("duration"),
             )
         )
     return rows
+
+
+def parse_v02b_offsets(path: Path) -> list[OffsetEntry]:
+    """Deprecated alias."""
+    return parse_v03_offsets(path)
 
 
 def _parse_video_clipitems(track: ET.Element, files: dict[str, tuple[str, str]]) -> list[dict]:
     clips = []
     for ci in track.findall("clipitem"):
         basename, _ = _resolve_file(ci, files)
+        dur = ci.findtext("duration")
         clips.append(
             {
                 "name": ci.findtext("name", ""),
@@ -272,6 +289,7 @@ def _parse_video_clipitems(track: ET.Element, files: dict[str, tuple[str, str]])
                 "tl_end": int(ci.findtext("end", "0")),
                 "src_in": int(ci.findtext("in", "0")),
                 "src_out": int(ci.findtext("out", "0")),
+                "duration": int(dur) if dur else None,
             }
         )
     return clips
@@ -353,8 +371,8 @@ def _parse_av_clips(track: ET.Element, files: dict[str, tuple[str, str]]) -> lis
     return clips
 
 
-def parse_v02b_b_keyed_offsets(path: Path, audio_track_name: str) -> list[BKeyedOffset]:
-    """Pair v02b V2 B camera with named audio track; key by B source frame."""
+def parse_v03_b_keyed_offsets(path: Path, audio_track_name: str) -> list[BKeyedOffset]:
+    """Pair v03 V2 B camera with named audio track; key by B source frame."""
     root = ET.parse(path).getroot()
     files = _build_file_map(root)
     seq = root.find(".//sequence")
@@ -397,6 +415,8 @@ def parse_v02b_b_keyed_offsets(path: Path, audio_track_name: str) -> list[BKeyed
 
     rows: list[BKeyedOffset] = []
     for b, b_in, b_out, media, media_path, off, is_lav in _merge_b_keyed_rows(raw):
+        if not _filter_short_b_ranges(b_in, b_out):
+            continue
         rows.append(
             BKeyedOffset(
                 b_file=b,
@@ -411,17 +431,22 @@ def parse_v02b_b_keyed_offsets(path: Path, audio_track_name: str) -> list[BKeyed
     return rows
 
 
+def parse_v02b_b_keyed_offsets(path: Path, audio_track_name: str) -> list[BKeyedOffset]:
+    """Deprecated alias."""
+    return parse_v03_b_keyed_offsets(path, audio_track_name)
+
+
 def load_reference_assemblies(
     reference_dir: Path | None = None,
 ) -> ReferenceBundle:
     ref = reference_dir or REFERENCE_DIR
-    v02b = ref / "081026-Stringout-Source-v02b-cg.xml"
+    v03 = ref / "081026-Stringout-Source-v03-cg.xml"
     return ReferenceBundle(
         june=parse_assembly(ref / "CMNH-SW-stringout-ref-270.xml", "june"),
         aug10=parse_assembly(ref / "081026-Stringout-Source-v02-cg.xml", "aug10"),
-        b_to_a=parse_v02b_offsets(v02b),
-        b_to_boom=parse_v02b_b_keyed_offsets(v02b, "BOOM"),
-        b_to_lav=parse_v02b_b_keyed_offsets(v02b, "LAV"),
+        b_to_a=parse_v03_offsets(v03),
+        b_to_boom=parse_v03_b_keyed_offsets(v03, "BOOM"),
+        b_to_lav=parse_v03_b_keyed_offsets(v03, "LAV"),
     )
 
 

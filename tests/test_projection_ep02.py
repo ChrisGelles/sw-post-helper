@@ -44,18 +44,29 @@ def test_projection_ep02_from_fixture_data():
     assert got == sample["pieces"]
 
 
-def test_v02b_usable_offset_rows_exclude_defect():
+def test_v03_offset_table_fourteen_rows_including_b009():
     refs = load_reference_assemblies()
-    assert len(refs.b_to_a) == 13
-    assert not any(o.b_file == "B009C001_130101_R1IB.mov" for o in refs.b_to_a)
+    assert len(refs.b_to_a) == 14
+    b009 = [o for o in refs.b_to_a if o.b_file == "B009C001_130101_R1IB.mov"]
+    assert len(b009) == 1
+    assert b009[0].name_matches_file
+    assert b009[0].offset == -1
 
 
-def test_v02b_boom_offset_table_sixteen_rows():
+def test_v03_boom_offset_table_sixteen_rows():
     refs = load_reference_assemblies()
     assert len(refs.b_to_boom) == 16
     destiny_lav = [o for o in refs.b_to_boom if o.media_file == "Destiny Take 02 Lav.wav"]
     assert len(destiny_lav) == 1
     assert destiny_lav[0].is_lav_on_boom_track
+
+
+def test_v03_lav_offset_table_fifteen_rows():
+    refs = load_reference_assemblies()
+    assert len(refs.b_to_lav) == 15
+    caitlin = [o for o in refs.b_to_lav if o.media_file == "Lav 03 Caitlin Take 01.wav"]
+    assert len(caitlin) == 1
+    assert caitlin[0].b_src_in == 748
 
 
 def test_extract_proxy_cuts_finds_twelve_video_nested_cuts():

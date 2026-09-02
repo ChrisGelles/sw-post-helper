@@ -9,9 +9,9 @@ from pathlib import Path
 from swpost.assemblies import (
     ROLES,
     AssemblyMaps,
+    B013_A_CAMERA_GAP,
     BKeyedOffset,
-    CAITLIN_EXCLUDED_LAV,
-    CAITLIN_LAV_BOOM_DRIFT_FRAMES,
+    CAITLIN_INTERNAL_LAV_PACK,
     Interval,
     OffsetEntry,
     ReferenceBundle,
@@ -78,13 +78,13 @@ class ProjectionReport:
     piece_counts: dict[str, int] = field(default_factory=dict)
     empty_role_ranges: list[dict] = field(default_factory=list)
     offset_boundary_splits: list[dict] = field(default_factory=list)
-    dropped_a_camera: list[dict] = field(default_factory=list)
     absent_roles: list[dict] = field(default_factory=list)
     label_mismatches: list[dict] = field(default_factory=list)
     collisions: list[dict] = field(default_factory=list)
     link_defects: list[dict] = field(default_factory=list)
     boom_track_not_boom: list[dict] = field(default_factory=list)
-    excluded_lav: list[dict] = field(default_factory=list)
+    internal_lav_pack: list[dict] = field(default_factory=list)
+    name_file_mismatches: list[dict] = field(default_factory=list)
     b_keyed_accuracy_notes: list[dict] = field(default_factory=list)
 
 
@@ -297,6 +297,19 @@ def _project_interval_pieces(
     return pieces, empty_ranges
 
 
+def _subtract_b_source_gap(
+    r_in: int, r_out: int, gap_start: int, gap_end: int
+) -> list[tuple[int, int]]:
+    if r_out <= gap_start or r_in >= gap_end:
+        return [(r_in, r_out)]
+    parts: list[tuple[int, int]] = []
+    if r_in < gap_start:
+        parts.append((r_in, min(r_out, gap_start)))
+    if r_out > gap_end:
+        parts.append((max(r_in, gap_end), r_out))
+    return parts
+
+
 def _project_aug10_a_camera(
     cut: ProxyCut,
     b_pieces: list[ProjectedPiece],
@@ -304,84 +317,96 @@ def _project_aug10_a_camera(
     report: ProjectionReport,
 ) -> list[ProjectedPiece]:
     a_pieces: list[ProjectedPiece] = []
+    gap_lo, gap_hi = B013_A_CAMERA_GAP
     for bp in b_pieces:
-        mid_src = (bp.source_in + bp.source_out) // 2
-        entry = lookup_offset(offsets, bp.file_basename, mid_src)
-        if entry is None:
-            report.dropped_a_camera.append(
-                {
-                    "cut_label": cut.label,
-                    "b_file": bp.file_basename,
-                    "b_source_in": bp.source_in,
-                    "b_source_out": bp.source_out,
-                    "reason": "no offset entry (link defect or out of range)",
-                }
-            )
-            continue
-
-        # Split if source range crosses offset boundary within same B file.
-        boundaries = sorted(
-            {
-                e.b_src_in
-                for e in offsets
-                if e.b_file == bp.file_basename
-                and bp.source_in < e.b_src_in < bp.source_out
-            }
-        )
-        ranges = []
-        start = bp.source_in
-        for bnd in boundaries:
-            if start < bnd:
-                ranges.append((start, bnd))
-            start = bnd
-        ranges.append((start, bp.source_out))
-
-        if len(ranges) > 1:
-            report.offset_boundary_splits.append(
-                {
-                    "cut_label": cut.label,
-                    "b_file": bp.file_basename,
-                    "b_source_range": [bp.source_in, bp.source_out],
-                    "split_at": boundaries,
-                }
-            )
-
-        tl_len = bp.timeline_end - bp.timeline_start
-        src_len = bp.source_out - bp.source_in
-        for r_in, r_out in ranges:
+        for r_in, r_out in _split_b_source_ranges(bp, offsets):
             entry = lookup_offset(offsets, bp.file_basename, r_in)
             if entry is None:
+                report.empty_role_ranges.append(
+                    {
+                        "role": "CAM_A",
+                        "b_source_range": [r_in, r_out],
+                        "cut_label": cut.label,
+                        "b_file": bp.file_basename,
+                    }
+                )
                 continue
-            if r_in > bp.source_in and lookup_offset(offsets, bp.file_basename, r_in - 1) != entry:
-                prev = lookup_offset(offsets, bp.file_basename, r_in - 1)
-                if prev and prev.offset != entry.offset:
-                    report.offset_boundary_splits.append(
+            if not entry.name_matches_file:
+                report.name_file_mismatches.append(
+                    {
+                        "role": "CAM_A",
+                        "clipitem_name": entry.a_file,
+                        "cut_label": cut.label,
+                        "note": "name≠file on sync assembly — emit anyway",
+                    }
+                )
+            if r_in < gap_hi and r_out > gap_lo:
+                report.empty_role_ranges.append(
+                    {
+                        "role": "CAM_A",
+                        "b_source_range": [max(r_in, gap_lo), min(r_out, gap_hi)],
+                        "cut_label": cut.label,
+                        "b_file": bp.file_basename,
+                        "note": "v03 A011 clamp — no A-camera coverage",
+                    }
+                )
+            for s_in, s_out in _subtract_b_source_gap(r_in, r_out, gap_lo, gap_hi):
+                if s_in >= s_out:
+                    continue
+                a_in = s_in + entry.offset
+                a_out = s_out + entry.offset
+                a_dur = entry.a_duration
+                emit_end = s_out
+                if a_dur is not None and a_out > a_dur:
+                    emit_end = min(s_out, s_in + max(0, a_dur - entry.offset))
+                    if emit_end < s_out:
+                        report.empty_role_ranges.append(
+                            {
+                                "role": "CAM_A",
+                                "b_source_range": [emit_end, s_out],
+                                "cut_label": cut.label,
+                                "b_file": bp.file_basename,
+                                "note": (
+                                    f"No A-camera coverage — {entry.a_file} ends at "
+                                    f"source frame {a_dur}"
+                                ),
+                            }
+                        )
+                if emit_end <= s_in:
+                    continue
+                if a_dur is not None and (s_in + entry.offset) >= a_dur:
+                    report.empty_role_ranges.append(
                         {
+                            "role": "CAM_A",
+                            "b_source_range": [s_in, emit_end],
                             "cut_label": cut.label,
                             "b_file": bp.file_basename,
-                            "offsets": [prev.offset, entry.offset],
-                            "at_source": r_in,
+                            "note": f"A-camera source exceeds {entry.a_file} duration",
                         }
                     )
-            rel_in = (r_in - bp.source_in) / src_len if src_len else 0
-            rel_out = (r_out - bp.source_in) / src_len if src_len else 1
-            piece_tl_start = bp.timeline_start + round(rel_in * tl_len)
-            piece_tl_end = bp.timeline_start + round(rel_out * tl_len)
-            a_pieces.append(
-                ProjectedPiece(
-                    role="CAM_A",
-                    timeline_start=piece_tl_start,
-                    timeline_end=piece_tl_end,
-                    source_in=r_in + entry.offset,
-                    source_out=r_out + entry.offset,
-                    file_basename=entry.a_file,
-                    file_path=f"/Volumes/SW_SERIES/02_Assets/01_Video/01_Footage/PROXIES/2026-08-10/{entry.a_file}",
-                    person=bp.person,
-                    sourcetrack_index=1,
-                    cut_label=cut.label,
-                    enabled=False,
+                    continue
+                tl_len = bp.timeline_end - bp.timeline_start
+                src_len = bp.source_out - bp.source_in
+                rel_in = (s_in - bp.source_in) / src_len if src_len else 0
+                rel_out = (emit_end - bp.source_in) / src_len if src_len else 1
+                a_pieces.append(
+                    ProjectedPiece(
+                        role="CAM_A",
+                        timeline_start=bp.timeline_start + round(rel_in * tl_len),
+                        timeline_end=bp.timeline_start + round(rel_out * tl_len),
+                        source_in=s_in + entry.offset,
+                        source_out=emit_end + entry.offset,
+                        file_basename=entry.a_file,
+                        file_path=(
+                            f"/Volumes/SW_SERIES/02_Assets/01_Video/01_Footage/"
+                            f"PROXIES/2026-08-10/{entry.a_file}"
+                        ),
+                        person=bp.person,
+                        sourcetrack_index=1,
+                        cut_label=cut.label,
+                        enabled=False,
+                    )
                 )
-            )
     return a_pieces
 
 
@@ -420,20 +445,19 @@ def _project_b_keyed_role(
             if entry is None:
                 continue
 
-            if role == "LAV" and entry.media_file == CAITLIN_EXCLUDED_LAV:
-                report.excluded_lav.append(
+            if role == "LAV" and entry.media_file == CAITLIN_INTERNAL_LAV_PACK:
+                report.internal_lav_pack.append(
                     {
                         "cut_label": cut.label,
                         "b_file": bp.file_basename,
                         "b_source_range": [r_in, r_out],
-                        "lav_file": entry.media_file,
-                        "reason": (
-                            f"Caitlin take 01 lav is {CAITLIN_LAV_BOOM_DRIFT_FRAMES} frames "
-                            "out against boom on v02b; boom only for this take"
+                        "file": entry.media_file,
+                        "note": (
+                            "Internal lavalier pack; subclip name reads "
+                            "'Caitlin Take 01 Lav.wav'"
                         ),
                     }
                 )
-                continue
 
             if role == "BOOM":
                 if entry.is_lav_on_boom_track:
@@ -451,7 +475,7 @@ def _project_b_keyed_role(
                         {
                             "file": entry.media_file,
                             "note": (
-                                "Destiny take 01: v02 reads +332/+223, v02b reads +335/+226 "
+                                "Destiny take 01: v02 reads +332/+223, v03 reads +335/+226 "
                                 "— three-frame error floor for B-keyed audio"
                             ),
                         }
@@ -547,8 +571,8 @@ def project_sequence(
     june, aug10, offsets = refs.june, refs.aug10, refs.b_to_a
 
     report = ProjectionReport(sequence_name=sequence.name, sequence_uid=sequence.uid)
-    v02b_path = Path(__file__).resolve().parents[1] / "reference" / "081026-Stringout-Source-v02b-cg.xml"
-    for name, resolved in detect_link_defects(v02b_path):
+    v03_path = Path(__file__).resolve().parents[1] / "reference" / "081026-Stringout-Source-v03-cg.xml"
+    for name, resolved in detect_link_defects(v03_path):
         report.link_defects.append({"clipitem_name": name, "resolved_file": resolved})
 
     cuts = extract_proxy_cuts(root, sequence)
@@ -561,7 +585,7 @@ def project_sequence(
 
         for role in ROLES:
             if cut.shoot == "aug10" and role in ("CAM_A", "BOOM", "LAV"):
-                continue  # derived from CAM_B via v02b B-keyed tables
+                continue  # derived from CAM_B via v03 B-keyed tables
 
             intervals = assembly.intervals.get(role, [])
             pieces, empty = _project_interval_pieces(cut, role, intervals)
