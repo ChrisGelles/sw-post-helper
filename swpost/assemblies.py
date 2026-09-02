@@ -462,7 +462,15 @@ def scan_v03_audio_substitutions(path: Path) -> list[dict]:
                     "note": "intentional substitution — emit normally",
                 }
             )
-    return subs
+    seen: set[tuple[str, str, str]] = set()
+    unique: list[dict] = []
+    for row in subs:
+        key = (row["track"], row["clipitem_name"], row["resolved_file"])
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(row)
+    return unique
 
 
 def load_reference_assemblies(

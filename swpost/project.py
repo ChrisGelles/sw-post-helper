@@ -83,6 +83,7 @@ class ProjectionReport:
     boom_track_not_boom: list[dict] = field(default_factory=list)
     audio_substitutions: list[dict] = field(default_factory=list)
     b_keyed_accuracy_notes: list[dict] = field(default_factory=list)
+    nested_resolutions: list[dict] = field(default_factory=list)
 
 
 def _overlap(a_start: int, a_end: int, b_start: int, b_end: int) -> tuple[int, int] | None:
@@ -93,20 +94,110 @@ def _overlap(a_start: int, a_end: int, b_start: int, b_end: int) -> tuple[int, i
     return start, end
 
 
-def _nested_proxy_clip(
+VIDEO_SEQUENCE_SOURCE = "4752dfa9-7a7e-4a3b-a25b-cafde1a8d036"
+VIDEO_MEDIA_SOURCE = "e64ddf74-8fac-4682-8aa8-0e0ca2248949"
+
+
+def _nested_proxy_clips(nested: SequenceInfo) -> list[tuple[int, int, str, str]]:
+    """Return proxy clipitems on nested sequence video tracks."""
+    hits: list[tuple[int, int, str, str]] = []
+    for clip in nested.clips:
+        if not clip.proxy_basename or clip.track_kind != "video":
+            continue
+        hits.append(
+            (
+                clip.source_in,
+                clip.source_out,
+                clip.filepath or "",
+                clip.proxy_basename,
+            )
+        )
+    return hits
+
+
+def _resolve_nested_proxy_cut(
+    root: ET.Element,
+    index: ObjectIndex,
+    *,
+    outer_label: str,
+    trim_in: int,
+    trim_out: int,
     nested: SequenceInfo,
-) -> tuple[int, int, str] | None:
-    """Return (source_in, source_out, filepath) for the proxy inside a nested sequence."""
-    for clip in nested.clips:
-        if clip.proxy_basename and clip.track_kind == "video":
-            return clip.source_in, clip.source_out, clip.filepath or ""
-    for clip in nested.clips:
-        if clip.proxy_basename:
-            return clip.source_in, clip.source_out, clip.filepath or ""
-    return None
+    report: ProjectionReport,
+) -> ProxyCut | None:
+    inner_clips = _nested_proxy_clips(nested)
+    if len(inner_clips) != 1:
+        raise ProjectionError(
+            f"nested sequence {nested.name!r} for clip {outer_label!r} has "
+            f"{len(inner_clips)} proxy clipitems; expected exactly one"
+        )
+    inner_in, inner_out, fp, inner_base = inner_clips[0]
+    base = proxy_basename(fp) or inner_base
+    if not base or base not in PROXY_REGISTRY:
+        raise ProjectionError(
+            f"nested sequence {nested.name!r} for clip {outer_label!r} resolves to "
+            f"unknown proxy {base!r}; refusing to guess"
+        )
+
+    seq_el = None
+    for el in root.iter("Sequence"):
+        if el.get("ObjectUID") == nested.uid:
+            seq_el = el
+            break
+    if seq_el is not None:
+        for clip in nested.clips:
+            if clip.proxy_basename:
+                continue
+            holder = None
+            for el in root.iter("VideoClip"):
+                if el.findtext("Name") == clip.label:
+                    holder = el
+                    break
+            if holder is not None:
+                inline = holder.find("Clip")
+                if inline is not None:
+                    src_ref = inline.find("Source")
+                    if src_ref is not None:
+                        src = index.ref_oid(src_ref.get("ObjectRef"))
+                        if src is not None and src.tag == "VideoSequenceSource":
+                            raise ProjectionError(
+                                f"nested sequence {nested.name!r} contains deeper nesting "
+                                f"under clip {clip.label!r}; only one level is supported"
+                            )
+
+    so_in = inner_in + trim_in
+    so_out = inner_in + trim_out
+    report.nested_resolutions.append(
+        {
+            "outer_label": outer_label,
+            "nested_sequence": nested.name,
+            "nested_source_in": inner_in,
+            "nested_source_out": inner_out,
+            "outer_trim_in": trim_in,
+            "outer_trim_out": trim_out,
+            "composed_in": so_in,
+            "composed_out": so_out,
+            "proxy_basename": base,
+        }
+    )
+    return ProxyCut(
+        label=outer_label,
+        track_name="",
+        track_kind="video",
+        timeline_start=0,
+        timeline_end=0,
+        stringout_in=so_in,
+        stringout_out=so_out,
+        proxy_basename=base,
+        shoot=PROXY_REGISTRY[base]["shoot"],
+    )
 
 
-def extract_proxy_cuts(root: ET.Element, sequence: SequenceInfo) -> list[ProxyCut]:
+def extract_proxy_cuts(
+    root: ET.Element,
+    sequence: SequenceInfo,
+    report: ProjectionReport | None = None,
+) -> list[ProxyCut]:
     index = ObjectIndex(root)
     by_name = {s.name: s for s in iter_sequences(root)}
     cuts: dict[tuple, ProxyCut] = {}
@@ -193,29 +284,36 @@ def extract_proxy_cuts(root: ET.Element, sequence: SequenceInfo) -> list[ProxyCu
                     if nested is None:
                         nested = by_name.get(label)
                     if nested is None:
-                        continue
-                    inner = _nested_proxy_clip(nested)
-                    if inner is None:
-                        continue
-                    inner_in, inner_out, _fp = inner
+                        raise ProjectionError(
+                            f"clip {label!r} references nested sequence uid "
+                            f"{nested_uid!r} which was not found in project"
+                        )
                     trim_in = ticks_to_frames(inline.findtext("InPoint"))
                     trim_out = ticks_to_frames(inline.findtext("OutPoint"))
-                    so_in = inner_in + trim_in
-                    so_out = inner_in + trim_out
-                    base = "270p.mp4" if label.startswith("270p") else proxy_basename(_fp)
-                    if not base or base not in PROXY_REGISTRY:
+                    resolved = _resolve_nested_proxy_cut(
+                        root,
+                        index,
+                        outer_label=label,
+                        trim_in=trim_in,
+                        trim_out=trim_out,
+                        nested=nested,
+                        report=report or ProjectionReport(
+                            sequence_name=sequence.name, sequence_uid=sequence.uid
+                        ),
+                    )
+                    if resolved is None:
                         continue
-                    key = (tl_start, tl_end, so_in, so_out, base)
+                    key = (tl_start, tl_end, resolved.stringout_in, resolved.stringout_out, resolved.proxy_basename)
                     cuts[key] = ProxyCut(
                         label=label,
                         track_name=track_name,
                         track_kind="video",
                         timeline_start=tl_start,
                         timeline_end=tl_end,
-                        stringout_in=so_in,
-                        stringout_out=so_out,
-                        proxy_basename=base,
-                        shoot=PROXY_REGISTRY[base]["shoot"],
+                        stringout_in=resolved.stringout_in,
+                        stringout_out=resolved.stringout_out,
+                        proxy_basename=resolved.proxy_basename,
+                        shoot=resolved.shoot,
                     )
 
     # Direct proxy file refs on any track (e.g. audio) — dedupe if video already captured.
@@ -293,8 +391,6 @@ def _project_interval_pieces(
 
     if cursor < so_out:
         empty_ranges.append((cursor, so_out))
-    if not hits:
-        empty_ranges.append((so_in, so_out))
 
     return pieces, empty_ranges
 
@@ -555,7 +651,7 @@ def project_sequence(
                 }
             )
 
-    cuts = extract_proxy_cuts(root, sequence)
+    cuts = extract_proxy_cuts(root, sequence, report)
     report.cuts_processed = len(cuts)
     all_pieces: list[ProjectedPiece] = []
 

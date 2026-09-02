@@ -18,6 +18,7 @@ AUDIO_TRACK_GROUP = "80b8e3d5-6dca-4195-aefb-cb5f407ab009"
 class TimelineClip:
     track_name: str
     track_kind: str  # video | audio
+    track_index: int  # 0-based within video or audio group
     label: str
     timeline_start: int  # frames
     timeline_end: int  # frames
@@ -153,6 +154,7 @@ def _parse_track_item(
     track_name: str,
     track_kind: str,
     index: ObjectIndex,
+    track_index: int,
 ) -> TimelineClip | None:
     wrapper = index.ref_oid(track_item_ref)
     if wrapper is None:
@@ -189,6 +191,7 @@ def _parse_track_item(
     return TimelineClip(
         track_name=track_name,
         track_kind=track_kind,
+        track_index=track_index,
         label=label,
         timeline_start=tl_start,
         timeline_end=tl_end,
@@ -248,9 +251,13 @@ def iter_sequences(root: ET.Element) -> list[SequenceInfo]:
             else:
                 continue
 
-            for track_name, track_el in _tracks_from_group(group_el, index, kind):
+            for track_index, (track_name, track_el) in enumerate(
+                _tracks_from_group(group_el, index, kind)
+            ):
                 for ti in _track_items_from_track(track_el):
-                    clip = _parse_track_item(ti.get("ObjectRef"), track_name, kind, index)
+                    clip = _parse_track_item(
+                        ti.get("ObjectRef"), track_name, kind, index, track_index
+                    )
                     if clip is None:
                         continue
                     info.clips.append(clip)

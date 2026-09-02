@@ -115,3 +115,25 @@ def person_for_basename(basename: str) -> str:
     if basename in AUDIO_BASENAME_PERSON:
         return AUDIO_BASENAME_PERSON[basename]
     return "Unknown"
+
+
+# One Premiere label colour per person (all tracks).
+PERSON_LABEL_COLOR: dict[str, str] = {
+    "Kiki Redhead": "Mango",
+    "Jim Leonard": "Forest",
+    "Stacy Conté": "Caribbean",
+    "Stephanie Castro": "Cerulean",
+    "Tony Rook": "Iris",
+    "Morgan Sibbald": "Rose",
+    "Forrest Blackburn": "Lavender",
+    "Chi Lee": "Violet",
+    "Destiny Thomas": "Cerulean",
+    "Caitlin Colleary": "Mango",
+    "Nikki Burt": "Iris",
+    "Miranda Sinnott-Armstrong": "Rose",
+    "Emma Finestone": "Lavender",
+}
+
+
+def label_color_for_person(person: str) -> str:
+    return PERSON_LABEL_COLOR.get(person, "Forest")
