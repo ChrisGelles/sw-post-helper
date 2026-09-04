@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from swpost.cards import has_graphic_and_type_source_text
+from swpost.conform_report import ConformBuildReport
 from swpost.fcpxml import (
     analyze_xmeml,
     build_xmeml,
@@ -14,8 +16,10 @@ from swpost.fcpxml import (
     file_id,
     masterclip_id,
     native_video_scale,
+    offline_placeholder_basenames,
     write_xmeml,
 )
+from swpost.ledger import build_timeline_ledger
 from swpost.offline import assign_synthetic_offline_names, extract_offline_clips
 from swpost.paths import FORBIDDEN_PATHURL_FRAGMENTS
 from swpost.prproj import iter_sequences, load_prproj
@@ -30,11 +34,21 @@ SEQ_NAME = "STEM-ep4-rough-main-v01-cl"
 EP01_SEQ = "ep01-humans&color-v11-cc"
 
 
+def _offline_from_ledger(ledger, pieces):
+    entries = ledger.passthrough_entries() + ledger.card_entries()
+    return assign_synthetic_offline_names(
+        extract_offline_clips(entries),
+        pieces,
+    )
+
+
 def _ep04_bundle():
     root = load_prproj(EP04)
     seq = next(s for s in iter_sequences(root) if s.name == SEQ_NAME)
-    pieces, report = project_sequence(root, seq)
-    offline = assign_synthetic_offline_names(extract_offline_clips(seq), pieces)
+    ledger = build_timeline_ledger(root, seq)
+    ledger.raise_if_unclassified()
+    pieces, report = project_sequence(root, seq, ledger=ledger)
+    offline = _offline_from_ledger(ledger, pieces)
     return pieces, report, offline
 
 
@@ -137,6 +151,13 @@ def test_clipitem_ids_unique_and_masterclipid_present(tmp_path):
     assert len(ids) == len(set(ids)), "duplicate sequence clipitem ids"
 
     for el in seq_clipitems:
+        file_el = el.find("file")
+        if (
+            file_el is not None
+            and file_el.findtext("mediaSource") == "GraphicAndType"
+            and file_el.find("pathurl") is None
+        ):
+            continue
         mc = el.find("masterclipid")
         assert mc is not None and mc.text
 
@@ -233,14 +254,15 @@ def test_master_clip_count_matches_distinct_sources(tmp_path):
     inventory = analyze_xmeml(
         root,
         expected,
-        offline_basenames={o.output_basename for o in offline if o.synthetic},
+        offline_basenames=offline_placeholder_basenames(offline),
     )
     assert inventory.master_clip_count == inventory.real_source_master_clip_count + inventory.offline_placeholder_count
     assert inventory.master_clip_count == len(expected)
     timeline_refs = sum(inventory.master_clip_timeline_refs.values())
-    assert timeline_refs == 34 * 4 + 9 + len(offline)
-    assert inventory.offline_placeholder_count == sum(1 for o in offline if o.synthetic)
-    assert len({o.output_basename for o in offline if o.synthetic}) == inventory.offline_placeholder_count
+    empty_graphics = sum(1 for o in offline if o.empty_graphic)
+    assert timeline_refs == 34 * 4 + 9 + len(offline) - empty_graphics
+    assert inventory.offline_placeholder_count == len(offline_placeholder_basenames(offline))
+    assert len(offline_placeholder_basenames(offline)) == inventory.offline_placeholder_count
 
 
 def _ep01_bundle():
@@ -248,8 +270,10 @@ def _ep01_bundle():
         pytest.skip("ep01 project not available")
     root = load_prproj(EP01)
     seq = next(s for s in iter_sequences(root) if s.name == EP01_SEQ)
-    pieces, report = project_sequence(root, seq)
-    offline = assign_synthetic_offline_names(extract_offline_clips(seq), pieces)
+    ledger = build_timeline_ledger(root, seq)
+    ledger.raise_if_unclassified()
+    pieces, report = project_sequence(root, seq, ledger=ledger)
+    offline = _offline_from_ledger(ledger, pieces)
     return pieces, report, offline
 
 
@@ -314,19 +338,67 @@ def test_ids_derived_from_basename_ep01_and_ep04(tmp_path):
         assert file_id(bn) == file_id(bn)
 
 
-def test_ep01_no_empty_vo_bin(tmp_path):
+def test_master_clips_nest_media_track_clipitem(tmp_path):
+    pieces, report, offline = _ep04_bundle()
+    out = tmp_path / "ep04.xml"
+    root = build_xmeml(
+        sequence_name="STEM-ep04-conform-v01-cl",
+        seq_prefix="ep04",
+        pieces=pieces,
+        offline=offline,
+        report=report,
+    )
+    write_xmeml(out, root, expected_basenames=distinct_source_basenames(pieces, offline))
+    for clip in ET.parse(out).getroot().iter("clip"):
+        if clip.findtext("ismasterclip") != "TRUE":
+            continue
+        media = clip.find("media")
+        assert media is not None
+        video = media.find("video")
+        audio = media.find("audio")
+        if video is not None:
+            track = video.find("track")
+            assert track is not None
+            assert track.find("clipitem") is not None
+        if audio is not None:
+            tracks = audio.findall("track")
+            assert tracks
+            assert any(t.find("clipitem") is not None for t in tracks)
+        assert video is not None or audio is not None
+
+
+def test_sequence_has_uuid(tmp_path):
+    pieces, report, offline = _ep04_bundle()
+    root = build_xmeml(
+        sequence_name="STEM-ep04-conform-v01-cl",
+        seq_prefix="ep04",
+        pieces=pieces,
+        offline=offline,
+        report=report,
+    )
+    seq = root.find(".//sequence")
+    assert seq is not None
+    assert seq.find("uuid") is not None and seq.findtext("uuid")
+
+
+def test_ep01_vo_bin_holds_scratch_vo(tmp_path):
     pieces, report, offline = _ep01_bundle()
     out = tmp_path / "ep01.xml"
+    build_report = ConformBuildReport()
     root = build_xmeml(
         sequence_name="STEM-ep01-conform-v01-cl",
         seq_prefix="ep01",
         pieces=pieces,
         offline=offline,
         report=report,
+        build_report=build_report,
     )
     write_xmeml(out, root, expected_basenames=distinct_source_basenames(pieces, offline))
     text = out.read_text(encoding="utf-8")
-    assert "<name>VO</name>" not in text
+    assert "<name>VO</name>" in text
+    assert build_report.scratch_vo_relocate
+    for row in build_report.scratch_vo_relocate:
+        assert row["basename"] in text
 
 
 def test_sequence_clipitem_names_are_basenames(tmp_path):
@@ -347,3 +419,111 @@ def test_sequence_clipitem_names_are_basenames(tmp_path):
         name = ci.findtext("name") or ""
         assert "/" not in name
         assert not name.startswith("270p_")
+
+
+def test_color_matte_offline_emits_generatoritems(tmp_path):
+    pieces, report, offline = _ep04_bundle()
+    graphic_offline = [o for o in offline if o.empty_graphic]
+    assert graphic_offline, "ep04 fixture should include synthetic Graphic clips"
+    build_report = ConformBuildReport()
+    root = build_xmeml(
+        sequence_name="STEM-ep04-conform-v01-cl",
+        seq_prefix="ep04",
+        pieces=pieces,
+        offline=offline,
+        report=report,
+        build_report=build_report,
+    )
+    xml = ET.tostring(root, encoding="unicode")
+    assert "/04_Graphics/Card-" not in xml
+    assert "/_ConceptArt/Card-" not in xml
+    assert "GraphicAndType" not in xml or all(
+        has_graphic_and_type_source_text(ci)
+        for ci in root.iter("clipitem")
+        if ci.find("file") is not None
+        and ci.find("file").findtext("mediaSource") == "GraphicAndType"
+    )
+    mattes = [
+        gi
+        for gi in root.iter("generatoritem")
+        if gi.find("start") is not None
+        and gi.find("effect/effectid") is not None
+        and gi.findtext("effect/effectid") == "Color"
+    ]
+    assert len(mattes) == len(graphic_offline)
+    assert build_report.color_mattes_emitted == len(graphic_offline)
+    for gi in mattes:
+        assert gi.findtext("enabled") == "FALSE"
+        assert gi.findtext("effect/effectcategory") == "Matte"
+        assert gi.findtext("effect/effecttype") == "generator"
+        fill = gi.find("effect/parameter/value")
+        assert fill is not None
+        assert fill.findtext("red") == "0"
+        assert fill.findtext("green") == "0"
+        assert fill.findtext("blue") == "0"
+        info = gi.find("logginginfo/description")
+        assert info is not None and info.text
+
+
+def test_sequence_tracks_have_enabled_locked_and_unique_names(tmp_path):
+    pieces, report, offline = _ep04_bundle()
+    out = tmp_path / "ep04-tracks.xml"
+    root = build_xmeml(
+        sequence_name="STEM-ep04-conform-v01-cl",
+        seq_prefix="ep04",
+        pieces=pieces,
+        offline=offline,
+        report=report,
+    )
+    _write_ep04(root, out, pieces, offline)
+    tree = ET.parse(out)
+    root_el = tree.getroot()
+    seq = next(el for el in root_el.iter("sequence") if el.find("media") is not None)
+    for group_tag in ("video", "audio"):
+        group = seq.find(f"media/{group_tag}")
+        assert group is not None
+        for track in group.findall("track"):
+            if track.find("clipitem") is None:
+                continue
+            assert track.findtext("enabled") == "TRUE"
+            assert track.findtext("locked") == "FALSE"
+            if group_tag == "audio":
+                assert track.find("outputchannelindex") is not None
+
+    names: dict[str, int] = {}
+    for track in seq.findall(".//media/audio/track"):
+        if track.find("clipitem") is None:
+            continue
+        name = track.get("MZ.TrackName") or ""
+        names[name] = names.get(name, 0) + 1
+    for name, count in names.items():
+        assert count <= 2, f"track name {name!r} appears {count} times"
+        if count == 2:
+            indices = {
+                track.get("currentExplodedTrackIndex")
+                for track in seq.findall(".//media/audio/track")
+                if track.get("MZ.TrackName") == name
+            }
+            assert indices == {"0", "1"}
+
+
+def test_no_premiere_track_type_mono(tmp_path):
+    pieces, report, offline = _ep04_bundle()
+    out = tmp_path / "ep04-track-type.xml"
+    root = build_xmeml(
+        sequence_name="STEM-ep04-conform-v01-cl",
+        seq_prefix="ep04",
+        pieces=pieces,
+        offline=offline,
+        report=report,
+    )
+    _write_ep04(root, out, pieces, offline)
+    tree = ET.parse(out)
+    for track in tree.getroot().iter("track"):
+        track_type = track.get("premiereTrackType")
+        if track_type is None:
+            continue
+        assert track_type == "Stereo", (
+            f"track {track.get('MZ.TrackName')!r} has premiereTrackType={track_type!r}"
+        )
+

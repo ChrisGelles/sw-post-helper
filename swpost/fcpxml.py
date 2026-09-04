@@ -4,16 +4,24 @@ from __future__ import annotations
 
 import copy
 import re
+import subprocess
+import uuid
+import wave
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import quote, unquote
 
-from swpost.cards import CardClip
+from swpost.cards import (
+    CardClip,
+    build_color_matte_generatoritem,
+    has_graphic_and_type_source_text,
+    renamespace_card_clipitem,
+)
 from swpost.conform_report import ConformBuildReport
 from swpost.offline import OfflineClip, person_under_cam_b
 from swpost.overlap import OverlapTrim, trim_track_overlaps
-from swpost.paths import FORBIDDEN_PATHURL_FRAGMENTS, PROXY_REGISTRY, VOLUME_ROOT
+from swpost.paths import ASSET_VO, FORBIDDEN_PATHURL_FRAGMENTS, PROXY_REGISTRY, VOLUME_ROOT
 from swpost.person import label_color_for_person, person_for_basename
 from swpost.project import ProjectedPiece, ProjectionReport
 
@@ -21,6 +29,8 @@ OUTPUT_WIDTH = 1920
 OUTPUT_HEIGHT = 1080
 SEQ_RATE = (24, True)
 STILL_FILE_RATE = (30, True)
+PPRO_TICKS_PER_FRAME = 254016000000 * 1001 // 24000
+CONFORM_UUID_NS = uuid.UUID("6ba7b811-9dad-11d1-80b4-00c04fd430c8")
 
 CONFORM_VIDEO_TRACKS = 2  # V1-CAM-B=div0, V2-CAM-A=1; passthrough track 1+ sits above
 
@@ -47,6 +57,21 @@ CONFORM_AUDIO = (
     ("LAV_INT", "A3-LAV-INTERNAL", 2),
     ("VO", "A4-VO", 3),
 )
+
+# Copied from reference/CMNH-SW-stringout-ref-270.xml (Premiere export).
+PREMIERE_AUDIO_TRACK_ATTRS: dict[str, str] = {
+    "TL.SQTrackAudioKeyframeStyle": "0",
+    "TL.SQTrackShy": "0",
+    "TL.SQTrackExpandedHeight": "41",
+    "TL.SQTrackExpanded": "0",
+    "PannerCurrentValue": "0.5",
+    "PannerStartKeyframe": "-91445760000000000,0.5,0,0,0,0,0,0",
+    "PannerName": "Balance",
+    "premiereTrackType": "Stereo",
+}
+PREMIERE_PANNER_INVERTED = "true"
+PREMIERE_TRACK_TARGETED_MONO = "1"
+PREMIERE_TRACK_TARGETED_STEREO = "0"
 
 
 class XmemlError(Exception):
@@ -79,7 +104,7 @@ def distinct_source_basenames(
     offline: list[OfflineClip],
 ) -> set[str]:
     names = {p.file_basename for p in pieces}
-    names.update(o.output_basename for o in offline)
+    names.update(o.output_basename for o in offline if o.output_basename)
     return names
 
 
@@ -88,7 +113,11 @@ def real_source_basenames(pieces: list[ProjectedPiece]) -> set[str]:
 
 
 def offline_placeholder_basenames(offline: list[OfflineClip]) -> set[str]:
-    return {o.output_basename for o in offline if o.synthetic}
+    return {
+        o.output_basename
+        for o in offline
+        if o.synthetic and not o.empty_graphic and o.output_basename
+    }
 
 
 @dataclass(frozen=True)
@@ -100,7 +129,7 @@ class MediaDef:
     person: str
     shoot_date: str
     bin_camera: str | None  # CAM A | CAM B | None for audio
-    bin_kind: str  # footage | audio | graphics | vo
+    bin_kind: str  # footage | audio | audio_passthrough | graphics | graphics_reference | vo
     file_rate: tuple[int, bool]  # timebase, ntsc
     is_still: bool
     needs_video: bool
@@ -110,7 +139,7 @@ class MediaDef:
     scale: int | None
     clip_duration: int  # master clip / clipitem duration
     file_duration: int | None  # on <file> when not still
-    channelcount: int = 2
+    channelcount: int = 1
     is_offline_placeholder: bool = False
     lognote: str | None = None
 
@@ -126,6 +155,22 @@ def masterclip_id(basename: str) -> str:
 
 def file_id(basename: str) -> str:
     return f"file-{id_slug(basename)}"
+
+
+def masterclip_id_for_media_key(media_key: str) -> str:
+    return f"masterclip-{id_slug(media_key)}"
+
+
+def file_id_for_media_key(media_key: str) -> str:
+    return f"file-{id_slug(media_key)}"
+
+
+def deterministic_uuid(key: str) -> str:
+    return str(uuid.uuid5(CONFORM_UUID_NS, key))
+
+
+def frames_to_ppro_ticks(frames: int) -> int:
+    return frames * PPRO_TICKS_PER_FRAME
 
 
 def pathurl(path: str) -> str:
@@ -226,22 +271,85 @@ def _cut_shoot_dates(pieces: list[ProjectedPiece]) -> dict[str, str]:
     return by_cut
 
 
-def _person_for_offline_audio(
-    timeline_start: int,
-    timeline_end: int,
-    pieces: list[ProjectedPiece],
-) -> str | None:
-    person = person_under_cam_b(timeline_start, timeline_end, pieces)
-    if person and person not in ("Unknown", "Passthrough"):
-        return person
-    cam_b = sorted(
-        (p for p in pieces if p.role == "CAM_B"),
-        key=lambda p: p.timeline_start,
-    )
-    for piece in cam_b:
-        if piece.timeline_start <= timeline_start < piece.timeline_end:
-            return piece.person
-    return cam_b[0].person if cam_b else None
+CAPTURED_GENERATED_MARKER = "Captured and Generated"
+VO_ASSET_MARKER = "02_Audio/04_VO/"
+
+
+def _audio_channelcount(path: str) -> int:
+    """Read channel count from media on disk; default mono when unavailable."""
+    p = Path(path)
+    if not p.is_file():
+        return 1
+    ext = p.suffix.lower()
+    if ext == ".wav":
+        try:
+            with wave.open(str(p), "rb") as handle:
+                return max(1, handle.getnchannels())
+        except (OSError, wave.Error):
+            return 1
+    if ext in (".mov", ".mp4", ".m4a"):
+        try:
+            proc = subprocess.run(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "a:0",
+                    "-show_entries",
+                    "stream=channels",
+                    "-of",
+                    "csv=p=0",
+                    str(p),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            if proc.returncode == 0 and proc.stdout.strip().isdigit():
+                return max(1, int(proc.stdout.strip()))
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    return 1
+
+
+def _path_is_under_vo_asset(path: str) -> bool:
+    normalized = path.replace("\\", "/")
+    return VO_ASSET_MARKER in normalized or normalized.startswith(ASSET_VO.rstrip("/"))
+
+
+def _path_is_captured_generated(path: str) -> bool:
+    return CAPTURED_GENERATED_MARKER in path.replace("\\", "/")
+
+
+def _is_reference_render(o: OfflineClip) -> bool:
+    name = o.output_basename.lower()
+    path = o.output_path.lower()
+    ext = Path(o.output_basename).suffix.lower()
+    if ext not in (".mp4", ".mov"):
+        return False
+    if "rough" in name or "stringout" in name:
+        return True
+    return "/for_review/" in path or "/06_delivery/" in path
+
+
+def _offline_bin_kind(o: OfflineClip) -> str:
+    path = o.output_path.replace("\\", "/")
+    if _path_is_under_vo_asset(path):
+        return "vo"
+    if o.synthetic and o.output_role == "VO":
+        return "vo"
+    if o.synthetic:
+        return "graphics"
+    ext = Path(o.output_basename).suffix.lower()
+    if ext == ".wav" and _path_is_captured_generated(path):
+        return "vo"
+    if ext == ".wav":
+        return "audio_passthrough"
+    if _is_reference_render(o):
+        return "graphics_reference"
+    return "graphics"
 
 
 def _shoot_date_for_timeline(
@@ -263,21 +371,11 @@ def _shoot_date_for_timeline(
     return "2026-06-09"
 
 
-def _offline_bin_kind(o: OfflineClip) -> str:
-    if o.output_role == "VO":
-        return "vo"
-    if o.synthetic:
-        return "graphics"
-    ext = Path(o.output_basename).suffix.lower()
-    if ext == ".wav":
-        return "audio"
-    return "graphics"
-
-
 def _collect_media(
     pieces: list[ProjectedPiece],
     offline: list[OfflineClip],
     cut_dates: dict[str, str],
+    build_report: ConformBuildReport | None = None,
 ) -> dict[str, MediaDef]:
     max_out, video_refs, audio_refs = _usage_refs(pieces, offline)
     media: dict[str, MediaDef] = {}
@@ -292,6 +390,9 @@ def _collect_media(
         bin_kind: str,
         is_offline_placeholder: bool = False,
         lognote: str | None = None,
+        channelcount: int = 1,
+        masterclip_id_override: str | None = None,
+        file_id_override: str | None = None,
     ) -> MediaDef:
         is_still = _is_still_basename(basename)
         file_rate = _default_file_rate(basename)
@@ -306,11 +407,17 @@ def _collect_media(
         if is_still:
             clip_dur = max(clip_dur + 86400, clip_dur + 1)
         file_dur = None if is_still else max(max_out.get(basename, 1), 1)
+        if needs_video and not is_still:
+            channelcount = _audio_channelcount(path)
+            if channelcount >= 1:
+                needs_audio = True
+        elif needs_audio:
+            channelcount = _audio_channelcount(path)
         return MediaDef(
             basename=basename,
             path=path,
-            masterclip_id=masterclip_id(basename),
-            file_id=file_id(basename),
+            masterclip_id=masterclip_id_override or masterclip_id(basename),
+            file_id=file_id_override or file_id(basename),
             person=person,
             shoot_date=shoot_date,
             bin_camera=bin_camera,
@@ -324,6 +431,7 @@ def _collect_media(
             scale=sc,
             clip_duration=clip_dur,
             file_duration=file_dur,
+            channelcount=channelcount,
             is_offline_placeholder=is_offline_placeholder,
             lognote=lognote,
         )
@@ -347,27 +455,41 @@ def _collect_media(
             bin_kind="footage" if is_cam else "audio",
         )
 
+    known_basenames = {md.basename for md in media.values()}
+
     for o in offline:
-        if o.output_basename in media:
+        if o.empty_graphic or not o.output_basename or not o.media_key:
+            continue
+        if o.media_key in media or o.output_basename in known_basenames:
             continue
         bin_kind = _offline_bin_kind(o)
-        person = _person_for_offline_audio(o.timeline_start, o.timeline_end, pieces) or "Unknown"
-        if bin_kind == "audio" and person in ("Unknown", "Passthrough"):
-            raise XmemlError(
-                f"passthrough audio {o.output_basename!r} at timeline "
-                f"{o.timeline_start}-{o.timeline_end} has unresolved person"
+        path = o.output_path.replace("\\", "/")
+        if (
+            bin_kind == "vo"
+            and _path_is_captured_generated(path)
+            and build_report is not None
+        ):
+            build_report.scratch_vo_relocate.append(
+                {
+                    "basename": o.output_basename,
+                    "path": o.output_path,
+                }
             )
         shoot = _shoot_date_for_timeline(o.timeline_start, o.timeline_end, pieces, cut_dates)
-        media[o.output_basename] = build_def(
+        label_person = "Passthrough"
+        media[o.media_key] = build_def(
             basename=o.output_basename,
             path=o.output_path,
-            person=person if bin_kind == "audio" else "Graphics",
+            person=label_person,
             shoot_date=shoot,
             bin_camera=None,
             bin_kind=bin_kind,
             is_offline_placeholder=o.synthetic,
             lognote=o.label if o.synthetic else None,
+            masterclip_id_override=masterclip_id_for_media_key(o.media_key),
+            file_id_override=file_id_for_media_key(o.media_key),
         )
+        known_basenames.add(o.output_basename)
     return media
 
 
@@ -410,7 +532,7 @@ def _append_file_def(parent: ET.Element, md: MediaDef, *, full: bool) -> None:
         _subel(parent, "file", id=md.file_id)
         return
     fe = _subel(parent, "file", id=md.file_id)
-    _subel(fe, "name", md.basename)
+    _subel(fe, "name", Path(md.path).name)
     _subel(fe, "pathurl", pathurl(md.path))
     _append_rate(fe, md.file_rate)
     if not md.is_still and md.file_duration is not None:
@@ -452,39 +574,86 @@ def _append_scale_filter(parent: ET.Element, scale: int | None) -> None:
     _subel(param, "value", scale)
 
 
+def _append_sequence_logginginfo(
+    parent: ET.Element,
+    *,
+    description: str | None = None,
+    lognote: str | None = None,
+) -> None:
+    info = _subel(parent, "logginginfo")
+    _subel(info, "description", description or "")
+    _subel(info, "scene", "")
+    _subel(info, "shottake", "")
+    _subel(info, "lognote", lognote or "")
+    _subel(info, "good", "")
+
+
+def _append_colorinfo(parent: ET.Element) -> None:
+    info = _subel(parent, "colorinfo")
+    for tag in ("lut", "lut1", "asc_sop", "asc_sat", "lut2"):
+        _subel(info, tag, "")
+
+
 def _append_lognote(parent: ET.Element, text: str | None) -> None:
     if not text:
         return
-    info = _subel(parent, "logginginfo")
-    _subel(info, "lognote", text)
+    _append_sequence_logginginfo(parent, lognote=text)
+
+
+def _append_master_clipitem(
+    track_el: ET.Element,
+    *,
+    clip_id: str,
+    md: MediaDef,
+    full_file: bool,
+    audio_track_index: int | None = None,
+) -> None:
+    ci = _subel(track_el, "clipitem", id=clip_id)
+    _subel(ci, "masterclipid", md.masterclip_id)
+    _subel(ci, "name", md.basename)
+    _seq_rate(ci)
+    _subel(ci, "duration", md.clip_duration)
+    _subel(ci, "in", 0)
+    _subel(ci, "out", md.clip_duration)
+    _append_file_def(ci, md, full=full_file)
+    if md.needs_video and full_file:
+        _append_scale_filter(ci, md.scale)
+    if audio_track_index is not None:
+        st = _subel(ci, "sourcetrack")
+        _subel(st, "mediatype", "audio")
+        _subel(st, "trackindex", audio_track_index)
 
 
 def _append_master_clip(bin_el: ET.Element, md: MediaDef, ids: _ClipIdGen) -> None:
     clip = _subel(bin_el, "clip", id=md.masterclip_id)
+    _subel(clip, "uuid", deterministic_uuid(md.masterclip_id))
     _subel(clip, "masterclipid", md.masterclip_id)
     _subel(clip, "ismasterclip", "TRUE")
     _subel(clip, "duration", md.clip_duration)
     _seq_rate(clip)
     _subel(clip, "name", md.basename)
-    _append_lognote(clip, md.lognote)
     media = _subel(clip, "media")
-    track_kind = "video" if md.needs_video else "audio"
-    tr = _subel(media, track_kind)
-    ci = _subel(tr, "clipitem", id=ids.next("mc"))
-    _subel(ci, "masterclipid", md.masterclip_id)
-    _subel(ci, "name", md.basename)
-    _subel(ci, "enabled", "TRUE")
-    _subel(ci, "duration", md.clip_duration)
-    _seq_rate(ci)
-    _subel(ci, "in", 0)
-    _subel(ci, "out", md.clip_duration)
-    _append_file_def(ci, md, full=True)
     if md.needs_video:
-        _append_scale_filter(ci, md.scale)
-    if md.needs_audio and not md.needs_video:
-        st = _subel(ci, "sourcetrack")
-        _subel(st, "mediatype", "audio")
-        _subel(st, "trackindex", 1)
+        video = _subel(media, "video")
+        track = _subel(video, "track")
+        _append_master_clipitem(
+            track,
+            clip_id=ids.next("mc"),
+            md=md,
+            full_file=True,
+        )
+    if md.needs_audio:
+        audio = _subel(media, "audio")
+        channels = max(1, md.channelcount)
+        for ch_idx in range(1, channels + 1):
+            track = _subel(audio, "track")
+            _append_master_clipitem(
+                track,
+                clip_id=ids.next("mc"),
+                md=md,
+                full_file=not md.needs_video and ch_idx == 1,
+                audio_track_index=ch_idx,
+            )
 
 
 def _append_sequence_clipitem(
@@ -498,13 +667,14 @@ def _append_sequence_clipitem(
     source_out: int,
     enabled: bool,
     person: str,
+    log_description: str | None = None,
     lognote: str | None = None,
     on_audio_track: bool = False,
+    premiere_channel_type: str | None = None,
 ) -> None:
     ci = _subel(track_el, "clipitem", id=clip_id)
     _subel(ci, "masterclipid", md.masterclip_id)
     _subel(ci, "name", md.basename)
-    _append_lognote(ci, lognote)
     _subel(ci, "enabled", "TRUE" if enabled else "FALSE")
     _subel(ci, "duration", md.clip_duration)
     _seq_rate(ci)
@@ -512,16 +682,92 @@ def _append_sequence_clipitem(
     _subel(ci, "end", piece_tl_end)
     _subel(ci, "in", source_in)
     _subel(ci, "out", source_out)
-    _append_file_def(ci, md, full=False)
-    if md.needs_video:
-        _append_scale_filter(ci, md.scale)
-    if on_audio_track or (md.needs_audio and not md.needs_video):
-        ci.set("premiereChannelType", "mono")
+    _subel(ci, "pproTicksIn", frames_to_ppro_ticks(source_in))
+    _subel(ci, "pproTicksOut", frames_to_ppro_ticks(source_out))
+    is_audio = on_audio_track or (md.needs_audio and not md.needs_video)
+    if is_audio:
+        channel_type = premiere_channel_type or (
+            "stereo" if md.channelcount >= 2 else "mono"
+        )
+        ci.set("premiereChannelType", channel_type)
+        _append_file_def(ci, md, full=False)
         st = _subel(ci, "sourcetrack")
         _subel(st, "mediatype", "audio")
         _subel(st, "trackindex", 1)
+        _append_sequence_logginginfo(
+            ci,
+            description=log_description,
+            lognote=lognote,
+        )
+        _append_colorinfo(ci)
+    else:
+        _subel(ci, "alphatype", "none")
+        _subel(ci, "pixelaspectratio", "square")
+        _subel(ci, "anamorphic", "FALSE")
+        _append_file_def(ci, md, full=False)
+        if md.needs_video:
+            _append_scale_filter(ci, md.scale)
+        _append_sequence_logginginfo(
+            ci,
+            description=log_description,
+            lognote=lognote,
+        )
+        _append_colorinfo(ci)
     labels = _subel(ci, "labels")
     _subel(labels, "label2", label_color_for_person(person))
+
+
+def _append_audio_clipitems(
+    track_els: list[ET.Element],
+    *,
+    clip_id: str,
+    md: MediaDef,
+    piece_tl_start: int,
+    piece_tl_end: int,
+    source_in: int,
+    source_out: int,
+    enabled: bool,
+    person: str,
+    log_description: str | None = None,
+    lognote: str | None = None,
+) -> None:
+    if md.channelcount >= 2:
+        if len(track_els) < 2:
+            raise XmemlError(
+                f"stereo clip {md.basename!r} needs exploded pair tracks, got {len(track_els)}"
+            )
+        for idx, track_el in enumerate(track_els[:2]):
+            _append_sequence_clipitem(
+                track_el,
+                clip_id=f"{clip_id}-ch{idx}",
+                md=md,
+                piece_tl_start=piece_tl_start,
+                piece_tl_end=piece_tl_end,
+                source_in=source_in,
+                source_out=source_out,
+                enabled=enabled,
+                person=person,
+                log_description=log_description,
+                lognote=lognote,
+                on_audio_track=True,
+                premiere_channel_type="stereo",
+            )
+    else:
+        _append_sequence_clipitem(
+            track_els[0],
+            clip_id=clip_id,
+            md=md,
+            piece_tl_start=piece_tl_start,
+            piece_tl_end=piece_tl_end,
+            source_in=source_in,
+            source_out=source_out,
+            enabled=enabled,
+            person=person,
+            log_description=log_description,
+            lognote=lognote,
+            on_audio_track=True,
+            premiere_channel_type="mono",
+        )
 
 
 def _validate_clipitem_ids(root: ET.Element) -> None:
@@ -610,6 +856,13 @@ def _validate_masterclipid_resolution(
             continue
         mc_el = ci.find("masterclipid")
         if mc_el is None or not mc_el.text:
+            file_el = ci.find("file")
+            if (
+                file_el is not None
+                and file_el.findtext("mediaSource") == "GraphicAndType"
+                and file_el.find("pathurl") is None
+            ):
+                continue
             dangling.append("(missing masterclipid)")
             continue
         if mc_el.text in exempt:
@@ -622,19 +875,90 @@ def _validate_masterclipid_resolution(
         )
 
 
+def collect_card_masterclip_ids(root: ET.Element) -> set[str]:
+    """Masterclip ids for inline GraphicAndType cards (exempt from bin lookup)."""
+    exempt: set[str] = set()
+    for ci in root.iter("clipitem"):
+        if ci.find("start") is None:
+            continue
+        file_el = ci.find("file")
+        if file_el is None or file_el.findtext("mediaSource") != "GraphicAndType":
+            continue
+        mc_el = ci.find("masterclipid")
+        if mc_el is not None and mc_el.text:
+            exempt.add(mc_el.text)
+    return exempt
+
+
+def _file_is_inline_definition(file_el: ET.Element) -> bool:
+    return len(list(file_el)) > 0
+
+
+def _assert_full_file_structure(file_el: ET.Element, *, fid: str) -> None:
+    """Every full <file> definition requires name, rate, timecode, and <media>."""
+    missing = [
+        tag
+        for tag in ("name", "rate", "timecode", "media")
+        if file_el.find(tag) is None
+    ]
+    if missing:
+        raise XmemlError(
+            f"file {fid!r} missing required elements: {', '.join(missing)}"
+        )
+    media = file_el.find("media")
+    assert media is not None
+    has_video = media.find("video") is not None
+    has_audio = media.find("audio") is not None
+    if not has_video and not has_audio:
+        raise XmemlError(f"file {fid!r} <media> has neither <video> nor <audio>")
+
+
+def count_full_file_violations(root: ET.Element) -> list[str]:
+    """Return file ids whose full definitions lack name/rate/timecode/media."""
+    violations: list[str] = []
+    for file_el in root.iter("file"):
+        if not _file_is_inline_definition(file_el):
+            continue
+        fid = file_el.get("id") or "?"
+        missing = [
+            tag
+            for tag in ("name", "rate", "timecode", "media")
+            if file_el.find(tag) is None
+        ]
+        if missing:
+            violations.append(fid)
+    return violations
+
+
+def _file_is_full_definition(file_el: ET.Element) -> bool:
+    if file_el.find("pathurl") is not None:
+        return True
+    if file_el.findtext("mediaSource"):
+        return True
+    if file_el.find("media") is not None:
+        return True
+    return False
+
+
 def _validate_file_definitions(root: ET.Element) -> None:
     full_defs: dict[str, ET.Element] = {}
     for file_el in root.iter("file"):
         fid = file_el.get("id")
         if fid is None:
             continue
-        if file_el.find("pathurl") is not None:
-            if fid in full_defs:
-                raise XmemlError(f"duplicate full <file> definition for id {fid!r}")
+        if _file_is_full_definition(file_el) and fid not in full_defs:
             full_defs[fid] = file_el
-        else:
-            if fid not in full_defs:
-                raise XmemlError(f"bare <file id={fid!r}/> with no prior full definition")
+
+    for file_el in root.iter("file"):
+        fid = file_el.get("id")
+        if fid is None:
+            continue
+        if _file_is_full_definition(file_el):
+            if fid in full_defs and full_defs[fid] is not file_el:
+                raise XmemlError(f"duplicate full <file> definition for id {fid!r}")
+            continue
+        if fid not in full_defs:
+            raise XmemlError(f"bare <file id={fid!r}/> with no prior full definition")
 
     pathurl_ids: set[str] = set()
     for file_el in root.iter("file"):
@@ -795,19 +1119,44 @@ def _validate_track_media_kind(root: ET.Element) -> None:
 
 
 def _validate_file_media_blocks(root: ET.Element) -> None:
+    """B2: every full <file> definition requires name, rate, timecode, and <media>."""
     for file_el in root.iter("file"):
-        if file_el.find("pathurl") is None:
+        if not _file_is_inline_definition(file_el):
             continue
-        if file_el.find("media") is None:
-            fid = file_el.get("id") or "?"
-            raise XmemlError(f"file {fid!r} with pathurl missing <media> block")
+        fid = file_el.get("id") or "?"
+        _assert_full_file_structure(file_el, fid=fid)
+    for clip in root.iter("clip"):
+        if clip.findtext("ismasterclip") != "TRUE":
+            continue
+        name = clip.findtext("name") or "?"
+        media = clip.find("media")
+        if media is None:
+            raise XmemlError(f"master clip {name!r} missing <media>")
+        video = media.find("video")
+        if video is not None:
+            track = video.find("track")
+            if track is None or track.find("clipitem") is None:
+                raise XmemlError(
+                    f"master clip {name!r} missing clip/media/video/track/clipitem"
+                )
+        audio = media.find("audio")
+        if audio is not None:
+            tracks = audio.findall("track")
+            if not tracks or not any(t.find("clipitem") is not None for t in tracks):
+                raise XmemlError(
+                    f"master clip {name!r} missing clip/media/audio/track/clipitem"
+                )
+        if video is None and audio is None:
+            raise XmemlError(f"master clip {name!r} has empty <media>")
 
 
 ALLOWED_MASTER_CLIP_BIN = (
     re.compile(r"^Footage/\d{4}-\d{2}-\d{2}/CAM A$"),
     re.compile(r"^Footage/\d{4}-\d{2}-\d{2}/CAM B$"),
     re.compile(r"^Audio/\d{4}-\d{2}-\d{2}/[^/]+$"),
+    re.compile(r"^Audio/_Passthrough$"),
     re.compile(r"^Graphics$"),
+    re.compile(r"^Graphics/_Reference$"),
     re.compile(r"^VO$"),
     re.compile(r"^Seq$"),
 )
@@ -816,7 +1165,7 @@ ALLOWED_MASTER_CLIP_BIN = (
 def _bin_path_allowed(path: str) -> bool:
     if path.endswith("/Unknown") or "/Unknown/" in path:
         return False
-    if path.endswith("/Passthrough") or "/Passthrough/" in path:
+    if path.endswith("/Passthrough") and path != "Audio/_Passthrough":
         return False
     return any(p.match(path) for p in ALLOWED_MASTER_CLIP_BIN)
 
@@ -828,7 +1177,7 @@ def _validate_master_clip_bin_paths(root: ET.Element) -> None:
                 f"master clip {basename!r} in disallowed bin {bin_path!r}"
             )
         parts = bin_path.split("/")
-        if parts[0] == "Audio" and len(parts) == 3:
+        if parts[0] == "Audio" and len(parts) == 3 and parts[1] != "_Passthrough":
             person = parts[2]
             if person in ("Unknown", "Passthrough"):
                 raise XmemlError(
@@ -845,7 +1194,9 @@ def _pathurl_contains_basename(url: str, basename: str) -> bool:
 
 
 def _validate_ids_from_basenames(root: ET.Element) -> None:
-    for basename, mc_id, _ in _master_clips_in_bins(root):
+    for basename, mc_id, bin_path in _master_clips_in_bins(root):
+        if not bin_path.startswith("Footage/"):
+            continue
         expected = masterclip_id(basename)
         if mc_id != expected:
             raise XmemlError(
@@ -858,14 +1209,14 @@ def _validate_ids_from_basenames(root: ET.Element) -> None:
         fid = file_el.get("id")
         name = file_el.findtext("name") or ""
         expected_fid = file_id(name)
-        if fid != expected_fid:
+        url = file_el.findtext("pathurl") or ""
+        if fid != expected_fid and "/PROXIES/" in url:
             raise XmemlError(
                 f"file id for {name!r} is {fid!r}, expected {expected_fid!r}"
             )
         if fid in seen_full:
             raise XmemlError(f"duplicate full file definition for {fid!r}")
         seen_full.add(fid)
-        url = file_el.findtext("pathurl") or ""
         if not _pathurl_contains_basename(url, name):
             raise XmemlError(
                 f"pathurl for {name!r} does not contain basename: {url!r}"
@@ -925,6 +1276,14 @@ def _sort_track_clipitems(track_el: ET.Element) -> None:
         track_el.append(ci)
 
 
+def _prune_empty_sequence_tracks(media_group: ET.Element | None) -> None:
+    if media_group is None:
+        return
+    for track in list(media_group.findall("track")):
+        if track.find("clipitem") is None and track.find("generatoritem") is None:
+            media_group.remove(track)
+
+
 def prune_empty_bins(root: ET.Element) -> None:
     project = root.find("project")
     if project is None:
@@ -935,6 +1294,19 @@ def prune_empty_bins(root: ET.Element) -> None:
     for bin_el in list(children.findall("bin")):
         if not _prune_empty_bin(bin_el):
             children.remove(bin_el)
+
+
+def _file_channelcount(root: ET.Element, file_ref: ET.Element) -> int | None:
+    file_el = _resolve_file_el(root, file_ref)
+    if file_el is None:
+        return None
+    aud = file_el.find("media/audio")
+    if aud is None:
+        return None
+    cc = aud.find("channelcount")
+    if cc is None or cc.text is None:
+        return None
+    return int(cc.text)
 
 
 def _validate_sequence_audio_schema(root: ET.Element) -> None:
@@ -957,10 +1329,40 @@ def _validate_sequence_audio_schema(root: ET.Element) -> None:
     for tr in audio_group.findall("track"):
         if tr.find("clipitem") is None:
             continue
-        if tr.get("totalExplodedTrackCount") == "2":
-            raise XmemlError(
-                f"audio track {tr.get('MZ.TrackName')!r} uses stereo exploded pair"
-            )
+        exploded = int(tr.get("totalExplodedTrackCount", "1"))
+        for ci in tr.findall("clipitem"):
+            if ci.find("start") is None:
+                continue
+            file_ref = ci.find("file")
+            if file_ref is None:
+                continue
+            ch = _file_channelcount(root, file_ref)
+            if ch is None:
+                continue
+            ctype = ci.get("premiereChannelType", "")
+            track_name = tr.get("MZ.TrackName") or "audio"
+            if ch < 2:
+                if exploded != 1:
+                    raise XmemlError(
+                        f"mono file {ci.findtext('name')!r} on {track_name!r} "
+                        f"has totalExplodedTrackCount={exploded}, expected 1"
+                    )
+                if ctype != "mono":
+                    raise XmemlError(
+                        f"mono file {ci.findtext('name')!r} on {track_name!r} "
+                        f"has premiereChannelType={ctype!r}, expected mono"
+                    )
+            else:
+                if exploded != 2:
+                    raise XmemlError(
+                        f"stereo file {ci.findtext('name')!r} on {track_name!r} "
+                        f"has totalExplodedTrackCount={exploded}, expected 2"
+                    )
+                if ctype != "stereo":
+                    raise XmemlError(
+                        f"stereo file {ci.findtext('name')!r} on {track_name!r} "
+                        f"has premiereChannelType={ctype!r}, expected stereo"
+                    )
 
 
 def _validate_track_clipitem_order(root: ET.Element) -> None:
@@ -1006,6 +1408,9 @@ def validate_xmeml(
     _validate_track_media_kind(root)
     _validate_sequence_audio_schema(root)
     _validate_track_clipitem_order(root)
+    _validate_premiere_audio_track_types(root)
+    _validate_graphic_and_type_source_text(root)
+    _validate_track_controls(root)
     _validate_pathurls(root)
 
 
@@ -1150,6 +1555,326 @@ def _append_sequence_audio_header(audio: ET.Element) -> None:
         _subel(channel, "index", idx)
 
 
+def _audio_track_layout(channelcount: int) -> str:
+    return "stereo" if channelcount >= 2 else "mono"
+
+
+def _apply_premiere_audio_track_attrs(
+    track: ET.Element,
+    *,
+    exploded_index: int,
+    exploded_total: int,
+) -> None:
+    """Apply Premiere sequence audio track attributes from pinned assembly export."""
+    for key, value in PREMIERE_AUDIO_TRACK_ATTRS.items():
+        track.set(key, value)
+    track.set("currentExplodedTrackIndex", str(exploded_index))
+    track.set("totalExplodedTrackCount", str(exploded_total))
+    if exploded_total == 1:
+        track.set("MZ.TrackTargeted", PREMIERE_TRACK_TARGETED_MONO)
+    else:
+        track.set("MZ.TrackTargeted", PREMIERE_TRACK_TARGETED_STEREO)
+        track.set("PannerIsInverted", PREMIERE_PANNER_INVERTED)
+
+
+def _create_premiere_audio_track(
+    audio: ET.Element,
+    *,
+    track_name: str,
+    exploded_index: int,
+    exploded_total: int,
+) -> ET.Element:
+    tr = _subel(audio, "track")
+    tr.set("MZ.TrackName", track_name)
+    _apply_premiere_audio_track_attrs(
+        tr,
+        exploded_index=exploded_index,
+        exploded_total=exploded_total,
+    )
+    return tr
+
+
+def _append_track_controls(
+    track: ET.Element,
+    *,
+    is_audio: bool,
+    output_channel_index: int | None = None,
+) -> None:
+    _subel(track, "enabled", "TRUE")
+    _subel(track, "locked", "FALSE")
+    if is_audio:
+        if output_channel_index is None:
+            raise XmemlError("audio track missing outputchannelindex")
+        _subel(track, "outputchannelindex", output_channel_index)
+
+
+def _assign_audio_output_channel_indices(audio: ET.Element) -> None:
+    """Mono tracks route to 1; stereo exploded pairs use 1 and 2."""
+    for track in audio.findall("track"):
+        if track.find("clipitem") is None:
+            continue
+        exploded = int(track.get("totalExplodedTrackCount", "1"))
+        if exploded == 2:
+            pair_idx = int(track.get("currentExplodedTrackIndex", "0"))
+            _append_track_controls(track, is_audio=True, output_channel_index=pair_idx + 1)
+        else:
+            _append_track_controls(track, is_audio=True, output_channel_index=1)
+
+
+def _build_audio_track_names(
+    needs: set[tuple[int, str]],
+    offline: list[OfflineClip],
+    media: dict[str, MediaDef],
+) -> dict[tuple[int, str], str]:
+    names: dict[tuple[int, str], str] = {}
+    for _role, label, logical in CONFORM_AUDIO:
+        for layout in ("mono", "stereo"):
+            if (logical, layout) in needs:
+                names[(logical, layout)] = label
+
+    editor_names: dict[int, str] = {}
+    for clip in offline:
+        if clip.track_kind == "audio" and clip.track_name:
+            editor_names.setdefault(clip.track_index, clip.track_name)
+
+    input_layouts: dict[int, set[str]] = {}
+    for clip in offline:
+        if clip.track_kind != "audio":
+            continue
+        md = media.get(clip.media_key)
+        if md is None:
+            continue
+        layout = _audio_track_layout(md.channelcount)
+        input_layouts.setdefault(clip.track_index, set()).add(layout)
+
+    for input_index, layouts in input_layouts.items():
+        logical = _passthrough_audio_logical_index(input_index)
+        base = editor_names.get(input_index) or f"A{input_index + 1}-PASSTHROUGH"
+        disambiguate = len(layouts) > 1
+        for layout in layouts:
+            key = (logical, layout)
+            if key not in needs:
+                continue
+            if disambiguate and layout == "mono":
+                names[key] = f"{base}-mono"
+            else:
+                names[key] = base
+
+    for logical in {idx for idx, _ in needs}:
+        layouts = {layout for idx, layout in needs if idx == logical}
+        if len(layouts) <= 1:
+            continue
+        base = next(
+            (names[(logical, layout)] for layout in ("stereo", "mono") if (logical, layout) in names),
+            _track_name_for_logical(logical),
+        )
+        if base.endswith("-mono"):
+            base = base[: -len("-mono")]
+        for layout in layouts:
+            key = (logical, layout)
+            if layout == "mono":
+                names[key] = f"{base}-mono"
+            else:
+                names[key] = base
+    return names
+
+
+def _assert_unique_track_names(video: ET.Element, audio: ET.Element) -> None:
+    """Physical sequence tracks must not share MZ.TrackName except stereo pairs."""
+    seen: dict[str, list[ET.Element]] = {}
+    for track in video.findall("track"):
+        if track.find("clipitem") is None:
+            continue
+        name = track.get("MZ.TrackName") or ""
+        seen.setdefault(name, []).append(track)
+    for track in audio.findall("track"):
+        if track.find("clipitem") is None:
+            continue
+        name = track.get("MZ.TrackName") or ""
+        seen.setdefault(name, []).append(track)
+
+    for name, tracks in seen.items():
+        if len(tracks) == 1:
+            continue
+        if len(tracks) == 2 and all(
+            int(tr.get("totalExplodedTrackCount", "1")) == 2 for tr in tracks
+        ):
+            indices = {tr.get("currentExplodedTrackIndex") for tr in tracks}
+            if indices == {"0", "1"}:
+                continue
+        raise XmemlError(
+            f"duplicate MZ.TrackName {name!r} on {len(tracks)} sequence tracks"
+        )
+
+
+def _validate_graphic_and_type_source_text(root: ET.Element) -> None:
+    for ci in root.iter("clipitem"):
+        if ci.find("start") is None:
+            continue
+        file_el = ci.find("file")
+        if file_el is None or file_el.findtext("mediaSource") != "GraphicAndType":
+            continue
+        if not has_graphic_and_type_source_text(ci):
+            name = ci.findtext("name") or "?"
+            raise XmemlError(
+                f"GraphicAndType clipitem {name!r} missing Source Text parameter"
+            )
+    for file_el in root.iter("file"):
+        if file_el.findtext("mediaSource") != "GraphicAndType":
+            continue
+        if file_el.find("pathurl") is not None:
+            continue
+        if file_el.find("start") is not None:
+            continue
+        parent = None
+        for ci in root.iter("clipitem"):
+            if ci.find("file") is file_el or (
+                ci.find("file") is not None
+                and ci.find("file").get("id") == file_el.get("id")
+            ):
+                parent = ci
+                break
+        if parent is not None and has_graphic_and_type_source_text(parent):
+            continue
+        if not has_graphic_and_type_source_text(file_el):
+            name = file_el.findtext("name") or "?"
+            raise XmemlError(
+                f"GraphicAndType file {name!r} missing Source Text parameter"
+            )
+
+
+def _validate_premiere_audio_track_types(root: ET.Element) -> None:
+    seq = _find_sequence(root)
+    if seq is None:
+        return
+    audio_group = seq.find("media/audio")
+    if audio_group is None:
+        return
+    for track in audio_group.findall("track"):
+        if track.find("clipitem") is None:
+            continue
+        track_type = track.get("premiereTrackType")
+        if track_type != "Stereo":
+            name = track.get("MZ.TrackName") or "audio"
+            raise XmemlError(
+                f"audio track {name!r} has premiereTrackType={track_type!r}, expected 'Stereo'"
+            )
+
+
+def _validate_track_controls(root: ET.Element) -> None:
+    seq = _find_sequence(root)
+    if seq is None:
+        return
+    media = seq.find("media")
+    if media is None:
+        return
+    for group_tag, is_audio in (("video", False), ("audio", True)):
+        group = media.find(group_tag)
+        if group is None:
+            continue
+        for track in group.findall("track"):
+            if track.find("clipitem") is None:
+                continue
+            if track.findtext("enabled") != "TRUE":
+                raise XmemlError(f"{group_tag} track missing enabled=TRUE")
+            if track.findtext("locked") != "FALSE":
+                raise XmemlError(f"{group_tag} track missing locked=FALSE")
+            if is_audio and track.find("outputchannelindex") is None:
+                name = track.get("MZ.TrackName") or group_tag
+                raise XmemlError(f"audio track {name!r} missing outputchannelindex")
+
+
+def _track_name_for_logical(logical: int) -> str:
+    return next(
+        (label for _, label, ti in CONFORM_AUDIO if ti == logical),
+        f"A{logical + 1}-PASSTHROUGH",
+    )
+
+
+def _collect_audio_track_needs(
+    pieces: list[ProjectedPiece],
+    offline: list[OfflineClip],
+    media: dict[str, MediaDef],
+) -> set[tuple[int, str]]:
+    role_to_logical = {role: idx for role, _, idx in CONFORM_AUDIO}
+    needs: set[tuple[int, str]] = set()
+    for piece in pieces:
+        if piece.role not in role_to_logical:
+            continue
+        md = media.get(piece.file_basename)
+        if md is None:
+            continue
+        needs.add((role_to_logical[piece.role], _audio_track_layout(md.channelcount)))
+    for clip in offline:
+        md = media.get(clip.media_key)
+        if md is None:
+            continue
+        is_wav = Path(clip.output_basename).suffix.lower() == ".wav"
+        if clip.output_role == "VO" or (is_wav and clip.track_kind == "video"):
+            logical = role_to_logical["VO"]
+        elif clip.track_kind == "audio":
+            logical = _passthrough_audio_logical_index(clip.track_index)
+        else:
+            continue
+        needs.add((logical, _audio_track_layout(md.channelcount)))
+    return needs
+
+
+def _create_audio_track_groups(
+    audio: ET.Element,
+    needs: set[tuple[int, str]],
+    logical_count: int,
+    track_names: dict[tuple[int, str], str],
+) -> dict[tuple[int, str], list[ET.Element]]:
+    groups: dict[tuple[int, str], list[ET.Element]] = {}
+    for logical in range(logical_count):
+        for layout in ("mono", "stereo"):
+            if (logical, layout) not in needs:
+                continue
+            track_name = track_names.get((logical, layout)) or _track_name_for_logical(
+                logical
+            )
+            if layout == "stereo":
+                tracks: list[ET.Element] = []
+                for pair_idx in range(2):
+                    tracks.append(
+                        _create_premiere_audio_track(
+                            audio,
+                            track_name=track_name,
+                            exploded_index=pair_idx,
+                            exploded_total=2,
+                        )
+                    )
+                groups[(logical, layout)] = tracks
+            else:
+                groups[(logical, layout)] = [
+                    _create_premiere_audio_track(
+                        audio,
+                        track_name=track_name,
+                        exploded_index=0,
+                        exploded_total=1,
+                    )
+                ]
+    return groups
+
+
+def _audio_tracks_for_clip(
+    groups: dict[tuple[int, str], list[ET.Element]],
+    logical: int,
+    channelcount: int,
+    *,
+    context: str,
+) -> list[ET.Element]:
+    layout = _audio_track_layout(channelcount)
+    key = (logical, layout)
+    tracks = groups.get(key)
+    if tracks is None:
+        raise XmemlError(
+            f"{context}: no {layout} audio track group for logical index {logical}"
+        )
+    return tracks
+
+
 def build_xmeml(
     *,
     sequence_name: str,
@@ -1162,7 +1887,8 @@ def build_xmeml(
 ) -> ET.Element:
     cut_dates = _cut_shoot_dates(pieces)
     _apply_overlap_trims(pieces, offline, build_report)
-    media = _collect_media(pieces, offline, cut_dates)
+    media = _collect_media(pieces, offline, cut_dates, build_report)
+    role_to_logical = {role: idx for role, _, idx in CONFORM_AUDIO}
     cards = cards or []
 
     seq_duration = 0
@@ -1186,12 +1912,18 @@ def build_xmeml(
     graphics = _subel(children, "bin")
     _subel(graphics, "name", "Graphics")
     graphics_children = _subel(graphics, "children")
+    graphics_ref = _subel(graphics_children, "bin")
+    _subel(graphics_ref, "name", "_Reference")
+    graphics_ref_children = _subel(graphics_ref, "children")
     has_vo = any(md.bin_kind == "vo" for md in media.values())
     vo_children = None
     if has_vo:
         vo_bin = _subel(children, "bin")
         _subel(vo_bin, "name", "VO")
         vo_children = _subel(vo_bin, "children")
+    audio_passthrough = _subel(audio_children, "bin")
+    _subel(audio_passthrough, "name", "_Passthrough")
+    audio_passthrough_children = _subel(audio_passthrough, "children")
     seq_bin = _subel(children, "bin")
     _subel(seq_bin, "name", "Seq")
     seq_bin_children = _subel(seq_bin, "children")
@@ -1218,9 +1950,13 @@ def build_xmeml(
             _append_master_clip(footage_camera_bins[cam_key], md, ids)
         elif md.bin_kind == "graphics":
             _append_master_clip(graphics_children, md, ids)
+        elif md.bin_kind == "graphics_reference":
+            _append_master_clip(graphics_ref_children, md, ids)
         elif md.bin_kind == "vo":
             assert vo_children is not None
             _append_master_clip(vo_children, md, ids)
+        elif md.bin_kind == "audio_passthrough":
+            _append_master_clip(audio_passthrough_children, md, ids)
         elif md.bin_kind == "audio":
             if md.person in ("Unknown", "Passthrough"):
                 raise XmemlError(
@@ -1241,9 +1977,10 @@ def build_xmeml(
             raise XmemlError(f"unplaced master clip {md.basename!r} (bin_kind={md.bin_kind!r})")
 
     sequence = _subel(seq_bin_children, "sequence", id=f"sequence-{seq_prefix}")
-    _subel(sequence, "name", sequence_name)
+    _subel(sequence, "uuid", deterministic_uuid(sequence_name))
     _subel(sequence, "duration", seq_duration)
     _seq_rate(sequence)
+    _subel(sequence, "name", sequence_name)
     tc = _subel(sequence, "timecode")
     _seq_rate(tc)
     _subel(tc, "string", "00:00:00:00")
@@ -1265,53 +2002,41 @@ def build_xmeml(
     audio = _subel(media_el, "audio")
     _append_sequence_audio_header(audio)
 
-    input_video_tracks = max(
-        [0] + [o.track_index + 1 for o in offline if o.track_kind == "video"]
-    )
     input_audio_tracks = max(
         [0] + [o.track_index + 1 for o in offline if o.track_kind == "audio"]
     )
-    max_passthrough_v = max(
-        [_passthrough_video_track_index(o.track_index) + 1 for o in offline if o.track_kind == "video"],
-        default=CONFORM_VIDEO_TRACKS,
-    )
-    video_track_count = max(CONFORM_VIDEO_TRACKS, max_passthrough_v, input_video_tracks)
     logical_audio_count = max(
         CONFORM_AUDIO_LOGICAL,
         input_audio_tracks + CONFORM_AUDIO_LOGICAL,
     )
 
     video_tracks: list[ET.Element] = []
-    for idx in range(video_track_count):
-        tr = _subel(video, "track")
-        name = next(
-            (label for _, label, ti in CONFORM_VIDEO if ti == idx),
-            f"V{idx + 1}-PASSTHROUGH",
-        )
-        tr.set("MZ.TrackName", name)
-        video_tracks.append(tr)
 
-    audio_tracks: list[ET.Element] = []
-    for logical in range(logical_audio_count):
-        tr = _subel(audio, "track")
-        tr.set("premiereTrackType", "Stereo")
-        tr.set("currentExplodedTrackIndex", "0")
-        tr.set("totalExplodedTrackCount", "1")
-        name = next(
-            (label for _, label, ti in CONFORM_AUDIO if ti == logical),
-            f"A{logical + 1}-PASSTHROUGH",
-        )
-        tr.set("MZ.TrackName", name)
-        audio_tracks.append(tr)
+    def ensure_video_track(idx: int) -> ET.Element:
+        while len(video_tracks) <= idx:
+            track_idx = len(video_tracks)
+            tr = _subel(video, "track")
+            name = next(
+                (label for _, label, ti in CONFORM_VIDEO if ti == track_idx),
+                f"V{track_idx + 1}-PASSTHROUGH",
+            )
+            tr.set("MZ.TrackName", name)
+            video_tracks.append(tr)
+        return video_tracks[idx]
+
+    for idx in range(CONFORM_VIDEO_TRACKS):
+        ensure_video_track(idx)
+
+    audio_track_needs = _collect_audio_track_needs(pieces, offline, media)
+    audio_track_names = _build_audio_track_names(audio_track_needs, offline, media)
+    audio_track_groups = _create_audio_track_groups(
+        audio, audio_track_needs, logical_audio_count, audio_track_names
+    )
 
     conform_video: dict[str, ET.Element] = {
         role: video_tracks[idx] for role, _, idx in CONFORM_VIDEO if idx < len(video_tracks)
     }
-    conform_audio: dict[str, ET.Element] = {
-        role: audio_tracks[idx]
-        for role, _, idx in CONFORM_AUDIO
-        if idx < len(audio_tracks)
-    }
+    conform_audio_roles = {role for role, _, _ in CONFORM_AUDIO}
     role_counters: dict[str, int] = {}
 
     def next_seq_id(role: str) -> str:
@@ -1319,63 +2044,112 @@ def build_xmeml(
         return ids.next(f"{role}-{role_counters[role]:04d}")
 
     for p in sorted(pieces, key=lambda x: (x.timeline_start, x.role)):
-        if p.role not in conform_video and p.role not in conform_audio:
+        if p.role not in conform_video and p.role not in conform_audio_roles:
             continue
         md = media.get(p.file_basename)
         if md is None:
             continue
-        on_audio = p.role in conform_audio
-        track_el = conform_audio[p.role] if on_audio else conform_video[p.role]
-        _append_sequence_clipitem(
-            track_el,
-            clip_id=next_seq_id(p.role),
-            md=md,
-            piece_tl_start=p.timeline_start,
-            piece_tl_end=p.timeline_end,
-            source_in=p.source_in,
-            source_out=p.source_out,
-            enabled=p.enabled,
-            person=p.person,
-            on_audio_track=on_audio,
-        )
+        on_audio = p.role in conform_audio_roles
+        if on_audio:
+            logical = role_to_logical[p.role]
+            track_els = _audio_tracks_for_clip(
+                audio_track_groups,
+                logical,
+                md.channelcount,
+                context=f"projected {p.file_basename!r}",
+            )
+            _append_audio_clipitems(
+                track_els,
+                clip_id=next_seq_id(p.role),
+                md=md,
+                piece_tl_start=p.timeline_start,
+                piece_tl_end=p.timeline_end,
+                source_in=p.source_in,
+                source_out=p.source_out,
+                enabled=p.enabled,
+                person=p.person,
+                log_description=p.cut_label,
+            )
+        else:
+            track_el = conform_video[p.role]
+            _append_sequence_clipitem(
+                track_el,
+                clip_id=next_seq_id(p.role),
+                md=md,
+                piece_tl_start=p.timeline_start,
+                piece_tl_end=p.timeline_end,
+                source_in=p.source_in,
+                source_out=p.source_out,
+                enabled=p.enabled,
+                person=p.person,
+                log_description=p.cut_label,
+                on_audio_track=False,
+            )
 
     for o in sorted(offline, key=lambda x: (x.timeline_start, x.output_role)):
-        md = media.get(o.output_basename)
+        if o.empty_graphic and o.track_kind == "video":
+            out_idx = _passthrough_video_track_index(o.track_index)
+            track_el = ensure_video_track(out_idx)
+            if o.track_name:
+                track_el.set("MZ.TrackName", o.track_name)
+            gi = build_color_matte_generatoritem(
+                label=o.label,
+                timeline_start=o.timeline_start,
+                timeline_end=o.timeline_end,
+                source_in=o.source_in,
+                source_out=o.source_out,
+                clip_id=ids.next("color-matte"),
+                rate=SEQ_RATE,
+            )
+            track_el.append(gi)
+            if build_report is not None:
+                build_report.color_mattes_emitted += 1
+            continue
+        md = media.get(o.media_key)
         if md is None:
             continue
         is_wav = Path(o.output_basename).suffix.lower() == ".wav"
         if o.output_role == "VO" or (is_wav and o.track_kind == "video"):
-            if "VO" not in conform_audio:
-                raise XmemlError("missing VO conform audio track")
-            track_el = conform_audio["VO"]
+            logical = role_to_logical["VO"]
+            track_els = _audio_tracks_for_clip(
+                audio_track_groups,
+                logical,
+                md.channelcount,
+                context=f"offline VO {o.output_basename!r}",
+            )
             role_key = "VO"
-            on_audio = True
         elif o.track_kind == "video":
             out_idx = _passthrough_video_track_index(o.track_index)
-            if out_idx >= len(video_tracks):
-                raise XmemlError(
-                    f"offline video clip {o.output_basename!r} maps to track "
-                    f"{out_idx} but only {len(video_tracks)} video tracks exist"
-                )
-            track_el = video_tracks[out_idx]
+            track_els = [ensure_video_track(out_idx)]
             role_key = f"V{out_idx}"
-            on_audio = False
+            _append_sequence_clipitem(
+                track_els[0],
+                clip_id=next_seq_id(role_key),
+                md=md,
+                piece_tl_start=o.timeline_start,
+                piece_tl_end=o.timeline_end,
+                source_in=o.source_in,
+                source_out=o.source_out,
+                enabled=True,
+                person=md.person,
+                log_description=o.label if o.synthetic else None,
+                lognote=o.label if o.synthetic else None,
+                on_audio_track=False,
+            )
+            continue
         elif o.track_kind == "audio":
             logical = _passthrough_audio_logical_index(o.track_index)
-            if logical >= logical_audio_count:
-                raise XmemlError(
-                    f"offline audio clip {o.output_basename!r} maps to logical track "
-                    f"{logical} but only {logical_audio_count} logical audio tracks exist"
-                )
-            track_el = audio_tracks[logical]
+            track_els = _audio_tracks_for_clip(
+                audio_track_groups,
+                logical,
+                md.channelcount,
+                context=f"offline audio {o.output_basename!r}",
+            )
             role_key = f"A{logical}"
-            on_audio = True
         else:
             raise XmemlError(f"unknown offline track_kind {o.track_kind!r}")
-        under = person_under_cam_b(o.timeline_start, o.timeline_end, pieces)
-        person = under or md.person or "Unknown"
-        _append_sequence_clipitem(
-            track_el,
+        _append_audio_clipitems(
+            track_els,
             clip_id=next_seq_id(role_key),
             md=md,
             piece_tl_start=o.timeline_start,
@@ -1383,37 +2157,50 @@ def build_xmeml(
             source_in=o.source_in,
             source_out=o.source_out,
             enabled=True,
-            person=person,
+            person=md.person,
+            log_description=o.label if o.synthetic else None,
             lognote=o.label if o.synthetic else None,
-            on_audio_track=on_audio,
         )
 
     max_card_track = max(
-        [c.track_index for c in cards] + [CONFORM_VIDEO_TRACKS - 1],
+        [_passthrough_video_track_index(c.track_index) for c in cards]
+        + [CONFORM_VIDEO_TRACKS - 1],
         default=CONFORM_VIDEO_TRACKS - 1,
     )
-    while len(video_tracks) <= max_card_track:
-        tr = _subel(video, "track")
-        tr.set("MZ.TrackName", f"V{len(video_tracks) + 1}-PASSTHROUGH")
-        video_tracks.append(tr)
+    for track_idx in range(CONFORM_VIDEO_TRACKS, max_card_track + 1):
+        ensure_video_track(track_idx)
 
     for card in sorted(cards, key=lambda c: c.timeline_start):
-        track_idx = card.track_index
-        if track_idx >= len(video_tracks):
-            raise XmemlError(
-                f"card {card.name!r} targets video track {track_idx} "
-                f"but only {len(video_tracks)} exist"
-            )
-        track_el = video_tracks[track_idx]
+        out_idx = _passthrough_video_track_index(card.track_index)
+        track_el = ensure_video_track(out_idx)
+        if card.track_name:
+            track_el.set("MZ.TrackName", card.track_name)
         ci = copy.deepcopy(card.clipitem)
-        ci.set("id", ids.next("card"))
+        file_name = card.name or card.clipitem.findtext("name") or "Graphic"
+        renamespace_card_clipitem(
+            ci,
+            clip_id=ids.next("card"),
+            masterclip_id=ids.next("cardmc"),
+            file_id=ids.next("cardfile"),
+            file_name=file_name,
+            width=OUTPUT_WIDTH,
+            height=OUTPUT_HEIGHT,
+            rate=SEQ_RATE,
+        )
         track_el.append(ci)
 
     for tr in video.findall("track"):
         _sort_track_clipitems(tr)
+        if tr.find("clipitem") is not None or tr.find("generatoritem") is not None:
+            _append_track_controls(tr, is_audio=False)
     for tr in audio.findall("track"):
         _sort_track_clipitems(tr)
 
+    _assign_audio_output_channel_indices(audio)
+    _assert_unique_track_names(video, audio)
+
+    _prune_empty_sequence_tracks(video)
+    _prune_empty_sequence_tracks(audio)
     prune_empty_bins(root)
     return root
 

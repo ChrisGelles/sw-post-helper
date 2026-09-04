@@ -34,3 +34,33 @@ def test_resolve_external_path_via_basename():
     resolved = resolve_media_path(external, relink, report)
     assert resolved == canonical
     assert report.applied
+
+
+def test_resolve_vo_scratch_path_to_temp_vo_folder():
+    relink = build_basename_relink_map()
+    report = RelinkReport()
+    basename = "Ep02-Ep09-Joey-Temp-VO-esv2-30p-bg-m-music-10p.wav"
+    source = f"/editor/project/02_Audio/04_VO/scratch/{basename}"
+    resolved = resolve_media_path(source, relink, report)
+    assert resolved is not None
+    assert resolved.endswith(f"/temp VO/{basename}")
+    assert report.applied
+    assert not report.unresolved
+
+
+def test_resolve_team_elevate_vendor_prefix():
+    relink = build_basename_relink_map()
+    report = RelinkReport()
+    source = (
+        "/Volumes/projects/POST PRODUCTION PROJECTS/CMNH/"
+        "02_Assets/02_Audio/01_Raw/2026.08.10/00. Field Recorder [Boom and Lav]/"
+        "03. Caitlin/Take 01/Caitlin Take 01 Lav.wav"
+    )
+    resolved = resolve_media_path(source, relink, report)
+    assert resolved is not None
+    assert resolved.startswith("/Volumes/SW_SERIES/")
+    assert resolved.endswith("Caitlin Take 01 Lav.wav")
+    assert "Catilin" in resolved
+    assert report.applied
+    assert not report.unresolved
+

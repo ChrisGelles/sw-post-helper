@@ -15,3 +15,11 @@ class ConformBuildReport:
     overlap_trims: list[OverlapTrim] = field(default_factory=list)
     nested_resolutions: list[dict] = field(default_factory=list)
     cards: CardBuildReport = field(default_factory=CardBuildReport)
+    scratch_vo_relocate: list[dict[str, str]] = field(default_factory=list)
+    pathurl_prefixes: dict[str, int] = field(default_factory=dict)
+    card_warnings: list[str] = field(default_factory=list)
+    style_layout_warning: str | None = None
+    dropped_embedded_camera_audio: list[dict[str, str | int]] = field(
+        default_factory=list
+    )
+    color_mattes_emitted: int = 0
