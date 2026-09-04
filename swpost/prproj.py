@@ -26,6 +26,16 @@ class TimelineClip:
     source_out: int  # frames
     filepath: str | None
     proxy_basename: str | None
+    clip_id: str = ""
+
+
+def timeline_clip_id(clip: TimelineClip) -> str:
+    if clip.clip_id:
+        return clip.clip_id
+    return (
+        f"{clip.track_kind}:{clip.track_index}:"
+        f"{clip.timeline_start}:{clip.timeline_end}:{clip.label}"
+    )
 
 
 @dataclass
@@ -188,7 +198,7 @@ def _parse_track_item(
         filepath, src_in, src_out = _resolve_media_from_clip_ref(clip_ref, index)
 
     base = proxy_basename(filepath)
-    return TimelineClip(
+    clip = TimelineClip(
         track_name=track_name,
         track_kind=track_kind,
         track_index=track_index,
@@ -200,6 +210,16 @@ def _parse_track_item(
         filepath=filepath,
         proxy_basename=base,
     )
+    clip.clip_id = timeline_clip_id(clip)
+    return clip
+
+
+def _track_display_name(track: ET.Element) -> str:
+    for el in track.iter("MZ.TrackName"):
+        text = (el.text or "").strip()
+        if text:
+            return text
+    return ""
 
 
 def _tracks_from_group(group_el: ET.Element, index: ObjectIndex, kind: str) -> list[tuple[str, ET.Element]]:
@@ -214,8 +234,7 @@ def _tracks_from_group(group_el: ET.Element, index: ObjectIndex, kind: str) -> l
         track = index.ref_uid(tr.get("ObjectURef"))
         if track is None:
             continue
-        name = track.findtext("MZ.TrackName", default="")
-        tracks.append((name, track))
+        tracks.append((_track_display_name(track), track))
     return tracks
 
 

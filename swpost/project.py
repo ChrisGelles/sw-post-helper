@@ -629,13 +629,20 @@ def project_sequence(
     root: ET.Element,
     sequence: SequenceInfo,
     refs: ReferenceBundle | None = None,
+    *,
+    ledger=None,
 ) -> tuple[list[ProjectedPiece], ProjectionReport]:
     if refs is None:
         refs = load_reference_assemblies()
 
     june, aug10, offsets = refs.june, refs.aug10, refs.b_to_a
 
-    report = ProjectionReport(sequence_name=sequence.name, sequence_uid=sequence.uid)
+    if ledger is not None:
+        report = ledger.projection_report
+        cuts = ledger.proxy_cuts
+    else:
+        report = ProjectionReport(sequence_name=sequence.name, sequence_uid=sequence.uid)
+        cuts = extract_proxy_cuts(root, sequence, report)
     report.audio_substitutions = list(refs.aug10_audio_substitutions)
     for entry in refs.b_to_boom:
         if entry.is_lav_on_boom_track:
@@ -651,7 +658,6 @@ def project_sequence(
                 }
             )
 
-    cuts = extract_proxy_cuts(root, sequence, report)
     report.cuts_processed = len(cuts)
     all_pieces: list[ProjectedPiece] = []
 

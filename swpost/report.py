@@ -104,6 +104,12 @@ def build_report_payload(
         ]
         payload["card_placeholders"] = build_report.cards.placeholders
         payload["scale_warnings"] = build_report.cards.scale_warnings
+        payload["scratch_vo_relocate"] = build_report.scratch_vo_relocate
+        payload["style_layout_warning"] = build_report.style_layout_warning
+        payload["dropped_embedded_camera_audio"] = (
+            build_report.dropped_embedded_camera_audio
+        )
+        payload["color_mattes_emitted"] = build_report.color_mattes_emitted
     return payload
 
 
@@ -126,6 +132,15 @@ def write_report(
         f"- **Output XML:** `{payload['xml_path']}`",
         "",
     ]
+    if build_report is not None and build_report.style_layout_warning:
+        lines.extend(
+            [
+                "## Style source",
+                "",
+                f"**{build_report.style_layout_warning}**",
+                "",
+            ]
+        )
     if "master_clip_count" in payload:
         lines.extend(
             [
@@ -167,9 +182,13 @@ def write_report(
     lines.extend(["", "## Offline clipitems", ""])
     if offline:
         for o in offline:
+            if o.empty_graphic:
+                dest = "color matte generator (STEM-physics-v07 reference shape)"
+            else:
+                dest = o.output_path or "(no path)"
             lines.append(
-                f"- `{o.label[:60]}` → `{o.output_path}` ({o.output_role}, "
-                f"synthetic={o.synthetic})"
+                f"- `{o.label[:60]}` → `{dest}` ({o.output_role}, "
+                f"synthetic={o.synthetic}, empty_graphic={o.empty_graphic})"
             )
     else:
         lines.append("- none")
@@ -181,9 +200,20 @@ def write_report(
                 f"- `{row['basename']}`: `{row['from_path']}` → `{row['to_path']}`"
             )
     if build_report is not None and build_report.relink.unresolved:
-        lines.extend(["", "## Unresolved media (left offline)", ""])
+        lines.extend(
+            [
+                "",
+                "## Unresolved media (will import offline — relink by hand)",
+                "",
+            ]
+        )
+        seen: set[str] = set()
         for row in build_report.relink.unresolved:
-            lines.append(f"- `{row['basename']}` from `{row['from_path']}`")
+            basename = row["basename"]
+            if basename in seen:
+                continue
+            seen.add(basename)
+            lines.append(f"- `{basename}` from `{row['from_path']}`")
     if build_report is not None and build_report.overlap_trims:
         lines.extend(["", "## Overlap trims", ""])
         for t in build_report.overlap_trims:
@@ -198,11 +228,72 @@ def write_report(
                 f"frames {row['composed_in']}–{row['composed_out']} on "
                 f"`{row['proxy_basename']}`"
             )
+    if build_report is not None and build_report.scratch_vo_relocate:
+        lines.extend(
+            [
+                "",
+                "## Scratch VO to be relocated to 02_Audio/04_VO/temp VO",
+                "",
+            ]
+        )
+        for row in build_report.scratch_vo_relocate:
+            lines.append(f"- `{row['basename']}` — `{row['path']}`")
+    if build_report is not None and build_report.dropped_embedded_camera_audio:
+        lines.extend(
+            [
+                "",
+                "## Dropped embedded camera audio",
+                "",
+                "Passthrough camera .mov audio removed where field recordings cover the same timeline range.",
+                "",
+            ]
+        )
+        seen: set[str] = set()
+        for row in build_report.dropped_embedded_camera_audio:
+            basename = str(row["basename"])
+            if basename in seen:
+                continue
+            seen.add(basename)
+            lines.append(
+                f"- `{basename}` — {row['timeline_start']}–{row['timeline_end']} "
+                f"(track index {row['track_index']})"
+            )
+    if build_report is not None and build_report.color_mattes_emitted:
+        lines.extend(
+            [
+                "",
+                "## Color mattes (unresolved animation/background)",
+                "",
+                f"- **{build_report.color_mattes_emitted}** disabled clip(s) emitted as Premiere "
+                "`Color` generator mattes (black fill, `enabled=FALSE`) — structure only, "
+                "no render.",
+                "- Reference shape: `STEM-physics-v07-cl.xml` generatoritem `clipitem-2062`.",
+                "",
+            ]
+        )
     if build_report is not None:
         lines.extend(["", "## Title cards", ""])
-        if build_report.cards.placeholders:
+        if build_report.card_warnings:
+            for warn in build_report.card_warnings:
+                lines.append(f"- **Warning:** {warn}")
+        lifted = sum(1 for c in build_report.cards.cards if c.status == "lifted")
+        synthesized = len(build_report.cards.synthesized)
+        if lifted:
+            lines.append(f"- **{lifted}** card(s) lifted verbatim from `--cards-from`.")
+        if synthesized:
             lines.append(
-                "- Cards emitted as **offline placeholders** (no `--cards-from` export)."
+                f"- **{synthesized}** card(s) synthesized via `build_source_text()` "
+                f"using style header from export."
+            )
+        if build_report.cards.placeholders and not build_report.cards.cards:
+            lines.append(
+                "- Cards emitted as **offline placeholders** "
+                "(no `--cards-from` / `--style-from`)."
+            )
+        elif build_report.cards.placeholders:
+            lines.append(
+                "- Some cards remain **offline placeholders** "
+                "(no export match / no marker text)."
             )
         for card in build_report.cards.cards:
             lines.append(
@@ -211,6 +302,12 @@ def write_report(
             )
         for warn in build_report.cards.scale_warnings:
             lines.append(f"- Scale warning: {warn}")
+    if build_report is not None and build_report.pathurl_prefixes:
+        lines.extend(["", "## Pathurl prefix audit", ""])
+        for prefix, count in sorted(
+            build_report.pathurl_prefixes.items(), key=lambda x: (-x[1], x[0])
+        ):
+            lines.append(f"- `{prefix}` × {count}")
 
     lines.extend(
         [
