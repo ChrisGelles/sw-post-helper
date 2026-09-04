@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 from swpost.build import build_conform
+from swpost.ledger import LedgerError
 from swpost.paths import require_volume
 from swpost.prproj import iter_sequences, load_prproj
 from swpost.project import ProjectionError
@@ -45,12 +46,20 @@ def cmd_build(
     sequence: str,
     out: Path | None,
     cards_from: Path | None,
+    style_from: Path | None,
 ) -> int:
     try:
         xml_path, md_path, json_path, _payload = build_conform(
-            project, sequence, out, cards_from=cards_from
+            project,
+            sequence,
+            out,
+            cards_from=cards_from,
+            style_from=style_from,
         )
     except ProjectionError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    except LedgerError as exc:
         print(str(exc), file=sys.stderr)
         return 1
     except ValueError as exc:
@@ -82,7 +91,13 @@ def main(argv: list[str] | None = None) -> int:
         "--cards-from",
         type=Path,
         default=None,
-        help="Exported Premiere XML to lift Essential Graphics card clipitems from",
+        help="Premiere export XML to lift Essential Graphics card clipitems from",
+    )
+    build_p.add_argument(
+        "--style-from",
+        type=Path,
+        default=None,
+        help="Premiere export XML supplying GraphicAndType style header for synthesis",
     )
 
     args = parser.parse_args(argv)
@@ -96,7 +111,7 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_list(args.project, args.all)
 
     if args.command == "build":
-        return cmd_build(args.project, args.sequence, args.out, args.cards_from)
+        return cmd_build(args.project, args.sequence, args.out, args.cards_from, args.style_from)
 
     return 2
 
